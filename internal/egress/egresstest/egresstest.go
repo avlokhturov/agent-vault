@@ -431,6 +431,7 @@ type SOCKS5Proxy struct {
 	pass    string
 	mu      sync.Mutex
 	dials   []string
+	atypes  []byte
 	refused int
 }
 
@@ -458,9 +459,21 @@ func (s *SOCKS5Proxy) DialCount() int {
 	return len(s.dials)
 }
 
-func (s *SOCKS5Proxy) record(target string) {
+// LastATYP reports the address type from the latest request (1=IPv4,
+// 3=domain, 4=IPv6), or zero when no request was recorded.
+func (s *SOCKS5Proxy) LastATYP() byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.atypes) == 0 {
+		return 0
+	}
+	return s.atypes[len(s.atypes)-1]
+}
+
+func (s *SOCKS5Proxy) record(target string, atyp byte) {
 	s.mu.Lock()
 	s.dials = append(s.dials, target)
+	s.atypes = append(s.atypes, atyp)
 	s.mu.Unlock()
 }
 
@@ -583,7 +596,7 @@ func (s *SOCKS5Proxy) handle(conn net.Conn) {
 	}
 	port := int(portBytes[0])<<8 | int(portBytes[1])
 	target = net.JoinHostPort(target, fmt.Sprint(port))
-	s.record(target)
+	s.record(target, head[3])
 
 	upstream, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {

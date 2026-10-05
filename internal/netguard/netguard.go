@@ -2,6 +2,7 @@ package netguard
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -173,33 +174,43 @@ func currentPolicy() (bool, []net.IPNet) {
 	return allowPrivate, allowed
 }
 
-// ValidateTargetName resolves host and applies the same private-range and
-// IMDS policy that direct connections enforce. It exists for egress code
-// paths (upstream proxying) where the broker does not dial the target
-// itself: the target address must still be vetted before it is handed to a
-// proxy, otherwise routing through a proxy would bypass network policy.
-//
-// Returns nil when the policy allows the host. Note that this validates the
-// addresses resolved *here*; when the proxy performs DNS resolution itself
-// (socks5h) a hostile resolver on the far side can still return an address
-// outside this check.
-func ValidateTargetName(ctx context.Context, host string) error {
+// ResolveTargetIPs resolves host and applies the same private-range and IMDS
+// policy that direct connections enforce. The returned addresses are the
+// exact addresses checked by policy, allowing callers to avoid a second DNS
+// lookup before dialing.
+func ResolveTargetIPs(ctx context.Context, host string) ([]net.IPAddr, error) {
 	if host == "" {
-		return fmt.Errorf("netguard: empty target host")
+		return nil, fmt.Errorf("netguard: empty target host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		ips := []net.IPAddr{{IP: ip}}
+		allowPrivate, allowed := currentPolicy()
+		if isBlockedIP(ip, allowPrivate, allowed) {
+			return nil, fmt.Errorf("netguard: connection to %s (%s) blocked by network policy", host, ip)
+		}
+		return ips, nil
 	}
 	allowPrivate, allowed := currentPolicy()
-
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		return fmt.Errorf("netguard: DNS lookup failed for %q: %w", host, err)
+		return nil, fmt.Errorf("netguard: DNS lookup failed for %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("netguard: DNS lookup returned no addresses for %q", host)
 	}
 	for _, ipAddr := range ips {
 		if isBlockedIP(ipAddr.IP, allowPrivate, allowed) {
-			return fmt.Errorf("netguard: connection to %s (%s) blocked by network policy",
+			return nil, fmt.Errorf("netguard: connection to %s (%s) blocked by network policy",
 				host, ipAddr.IP.String())
 		}
 	}
-	return nil
+	return ips, nil
+}
+
+// ValidateTargetName resolves host and applies the target network policy.
+func ValidateTargetName(ctx context.Context, host string) error {
+	_, err := ResolveTargetIPs(ctx, host)
+	return err
 }
 
 // ValidateTargetAddr applies ValidateTargetName to the host portion of an
@@ -210,6 +221,21 @@ func ValidateTargetAddr(ctx context.Context, addr string) error {
 		return fmt.Errorf("netguard: invalid address %q: %w", addr, err)
 	}
 	return ValidateTargetName(ctx, host)
+}
+
+// ValidateRemoteTargetName checks a name before sending it to a proxy that
+// resolves DNS remotely. Only a definitive NXDOMAIN may be deferred to that
+// trusted proxy; cancellation and transient resolver failures remain errors.
+func ValidateRemoteTargetName(ctx context.Context, host string) error {
+	_, err := ResolveTargetIPs(ctx, host)
+	if err == nil {
+		return nil
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound && ctx.Err() == nil {
+		return nil
+	}
+	return err
 }
 
 // SafeDialContext returns a DialContext function that blocks connections to
@@ -237,6 +263,9 @@ func SafeDialContext(allowPrivate bool) func(ctx context.Context, network, addr 
 		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if err != nil {
 			return nil, fmt.Errorf("netguard: DNS lookup failed for %q: %w", host, err)
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("netguard: DNS lookup returned no addresses for %q", host)
 		}
 
 		// Check all resolved IPs before connecting.

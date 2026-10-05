@@ -202,6 +202,9 @@ func (p *Proxy) Serve(l net.Listener) error {
 // Shutdown returns; the tunnels will die with it.
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.upstream.CloseIdleConnections()
+	if p.egress != nil {
+		p.egress.CloseIdleConnections()
+	}
 	return p.httpServer.Shutdown(ctx)
 }
 

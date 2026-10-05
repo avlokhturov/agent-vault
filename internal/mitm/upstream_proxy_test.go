@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"io"
 	"net"
@@ -518,6 +519,43 @@ func TestMITMNoProxySkipsUpstreamProxy(t *testing.T) {
 	}
 }
 
+func TestMITMNoProxyNeverTrustsProxyCAForHTTPSUpstream(t *testing.T) {
+	var reached atomic.Int32
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	authority := strings.TrimPrefix(upstream.URL, "https://")
+	upstreamHost, _, _ := net.SplitHostPort(authority)
+	sr := validTokenResolver("av_sess_ok",
+		&brokercore.ProxyScope{VaultID: "v1", VaultName: "default", VaultRole: "proxy"})
+	cp := &fakeCredProvider{byHost: map[string]fakeInjectResult{
+		upstreamHost: {result: &brokercore.InjectResult{MatchedName: "internal"}},
+	}}
+	route := profile("proxy-ca", brokercore.UpstreamProxySchemeHTTPS, authority)
+	route.NoProxy = authority
+	route.ProxyCAPEM = string(pem.EncodeToMemory(&pem.Block{
+		Type: "CERTIFICATE", Bytes: upstream.Certificate().Raw,
+	}))
+	res := &fakeUpstreamProxyResolver{global: route}
+	proxyURL, clientRoots, _ := setupProxy(t, sr, cp, withUpstreamProxyResolver(res))
+
+	client := newTrustingClient(proxyURL, url.User("av_sess_ok"), clientRoots)
+	resp, err := client.Get(upstream.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("request through broker: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 when target TLS is not trusted", resp.StatusCode)
+	}
+	if got := reached.Load(); got != 0 {
+		t.Fatalf("target with proxy-only CA received %d requests", got)
+	}
+}
+
 // --- Red line: policy still applies behind the proxy ---
 
 func TestMITMPolicyBlockedTargetNeverReachesUpstreamProxy(t *testing.T) {
@@ -602,15 +640,15 @@ func TestMITMUnusableProfileFailsClosed(t *testing.T) {
 	}
 }
 
-func TestMITMUnusableProfileFailsOpenReachesUpstreamDirectly(t *testing.T) {
+func TestMITMUnusableProfileFailsClosedEvenUnderFailOpen(t *testing.T) {
+	var hits int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
 		_, _ = io.WriteString(w, "hello-from-upstream")
 	}))
 	defer upstream.Close()
-
 	authority := strings.TrimPrefix(upstream.URL, "http://")
 	upstreamHost, _, _ := net.SplitHostPort(authority)
-
 	sr := validTokenResolver("av_sess_ok",
 		&brokercore.ProxyScope{VaultID: "v1", VaultName: "default", VaultRole: "proxy"})
 	cp := &fakeCredProvider{byHost: map[string]fakeInjectResult{
@@ -619,18 +657,18 @@ func TestMITMUnusableProfileFailsOpenReachesUpstreamDirectly(t *testing.T) {
 	broken := profile("broken", brokercore.UpstreamProxySchemeHTTP, "proxy.internal")
 	broken.OnFailure = brokercore.UpstreamProxyFailOpen
 	res := &fakeUpstreamProxyResolver{global: broken}
-
 	proxyURL, clientRoots, _ := setupProxy(t, sr, cp, withUpstreamProxyResolver(res))
 	client := newTrustingClient(proxyURL, url.User("av_sess_ok"), clientRoots)
-
 	resp, err := client.Get(upstream.URL + "/")
 	if err != nil {
 		t.Fatalf("request via broker: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "hello-from-upstream" {
-		t.Fatalf("body = %q, want the request to fall back to a direct dial", string(body))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 for invalid proxy configuration", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Fatalf("upstream received %d requests for unusable profile", got)
 	}
 }
 
@@ -751,8 +789,10 @@ func TestMITMFailOpenDoesNotAbsorbTargetSideFailures(t *testing.T) {
 	}
 }
 
-func TestMITMResolverFailureDegradesToDirect(t *testing.T) {
+func TestMITMResolverFailureFailsClosed(t *testing.T) {
+	var hits int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
 		_, _ = io.WriteString(w, "hello-from-upstream")
 	}))
 	defer upstream.Close()
@@ -779,13 +819,12 @@ func TestMITMResolverFailureDegradesToDirect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request via broker: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "hello-from-upstream" {
-		t.Fatalf("body = %q, want the request to survive a resolver outage", string(body))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 on resolver failure", resp.StatusCode)
 	}
-	if got := egressProxy.RequestCount(); got != 0 {
-		t.Fatalf("egress proxy saw %d requests while resolution was failing, want 0", got)
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Fatalf("target received %d requests during resolver failure", got)
 	}
 }
 

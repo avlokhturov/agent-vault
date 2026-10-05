@@ -417,3 +417,66 @@ func TestMergeServicesEnableToggleKeepsUpstreamProxy(t *testing.T) {
 		t.Fatalf("UpstreamProxy = %q, want corp-egress preserved through an enable toggle", merged[0].UpstreamProxy)
 	}
 }
+
+func TestMergeServicesSetPreservesDirectBypass(t *testing.T) {
+	existing := []broker.Service{{
+		Name:                "api-stripe-com",
+		Host:                "api.stripe.com",
+		Auth:                broker.Auth{Type: "bearer", Token: "OLD"},
+		BypassUpstreamProxy: true,
+	}}
+	proposed := []Service{
+		{Action: ActionSet, Name: "api-stripe-com", Host: "api.stripe.com", Auth: mergeBearer("NEW")},
+	}
+
+	merged, warnings := MergeServices(existing, proposed)
+	if len(warnings) != 0 || len(merged) != 1 {
+		t.Fatalf("merge result = %#v, warnings %v", merged, warnings)
+	}
+	if !merged[0].BypassUpstreamProxy {
+		t.Fatal("direct bypass was erased by service replacement")
+	}
+	if merged[0].Auth.Token != "NEW" {
+		t.Fatalf("Auth.Token = %q, want proposal update", merged[0].Auth.Token)
+	}
+}
+
+func TestMergeServicesEnableToggleKeepsDirectBypass(t *testing.T) {
+	disabled := false
+	existing := []broker.Service{{
+		Name:                "api-stripe-com",
+		Host:                "api.stripe.com",
+		Auth:                broker.Auth{Type: "bearer", Token: "OLD"},
+		BypassUpstreamProxy: true,
+	}}
+	proposed := []Service{
+		{Action: ActionSet, Name: "api-stripe-com", Host: "api.stripe.com", Enabled: &disabled},
+	}
+
+	merged, _ := MergeServices(existing, proposed)
+	if len(merged) != 1 || !merged[0].BypassUpstreamProxy {
+		t.Fatalf("direct bypass not preserved through enable toggle: %#v", merged)
+	}
+}
+
+func TestMergeServicesNewProposalDefaultsToDirect(t *testing.T) {
+	proposed := []Service{
+		{Action: ActionSet, Name: "api-stripe-com", Host: "api.stripe.com", Auth: mergeBearer("NEW")},
+	}
+	merged, _ := MergeServices(nil, proposed)
+	if len(merged) != 1 || !merged[0].BypassUpstreamProxy || merged[0].UseUpstreamProxy || merged[0].UpstreamProxy != "" {
+		t.Fatalf("new proposal failed to default to direct: %#v", merged)
+	}
+}
+
+func TestMergeServicesPreservesDefaultProxyOptIn(t *testing.T) {
+	existing := []broker.Service{{
+		Name: "api-stripe-com", Host: "api.stripe.com", Auth: broker.Auth{Type: "bearer", Token: "OLD"},
+		UseUpstreamProxy: true,
+	}}
+	proposed := []Service{{Action: ActionSet, Name: "api-stripe-com", Host: "api.stripe.com", Auth: mergeBearer("NEW")}}
+	merged, _ := MergeServices(existing, proposed)
+	if len(merged) != 1 || !merged[0].UseUpstreamProxy || merged[0].BypassUpstreamProxy || merged[0].UpstreamProxy != "" {
+		t.Fatalf("proposal changed operator's default proxy opt-in: %#v", merged)
+	}
+}

@@ -35,15 +35,16 @@ type Service struct {
 	Enabled       *bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	Auth          Auth           `yaml:"auth" json:"auth"`
 	Substitutions []Substitution `yaml:"substitutions,omitempty" json:"substitutions,omitempty"`
-	// UpstreamProxy names an instance-level egress proxy profile that carries
-	// this service's requests to the real upstream. Empty means "use the
-	// instance default (or dial directly when there is none)".
-	//
-	// Operators set this through the admin service endpoints; proposals keep
-	// whatever value is already stored (see proposal.merge#UpstreamProxy) so
-	// an agent can neither introduce nor drop egress routing for credentials
-	// it does not own.
+	// UpstreamProxy names an instance-level egress profile. A name opts this
+	// service into proxy routing regardless of the instance default.
+	// Operators own this setting; proposals preserve the stored route.
 	UpstreamProxy string `yaml:"upstream_proxy,omitempty" json:"upstream_proxy,omitempty"`
+	// UseUpstreamProxy opts into the instance default without naming a profile.
+	// New services with neither field are stored with BypassUpstreamProxy set.
+	UseUpstreamProxy bool `yaml:"use_upstream_proxy,omitempty" json:"use_upstream_proxy,omitempty"`
+	// BypassUpstreamProxy marks direct routing. Older services with no egress
+	// fields keep inheriting the instance default until explicitly changed.
+	BypassUpstreamProxy bool `yaml:"bypass_upstream_proxy,omitempty" json:"bypass_upstream_proxy,omitempty"`
 }
 
 // MatcherPattern returns the joined inline form (`slack.com/api/*`),
@@ -390,6 +391,12 @@ func Validate(cfg *Config) error {
 		}
 		if err := ValidateUpstreamProxyName(s.UpstreamProxy); err != nil {
 			return fmt.Errorf("service %d: %w", i, err)
+		}
+		if s.BypassUpstreamProxy && (s.UpstreamProxy != "" || s.UseUpstreamProxy) {
+			return fmt.Errorf("service %d: bypass_upstream_proxy cannot be combined with proxy routing", i)
+		}
+		if s.UseUpstreamProxy && s.UpstreamProxy != "" {
+			return fmt.Errorf("service %d: use_upstream_proxy cannot be combined with upstream_proxy", i)
 		}
 	}
 	return nil

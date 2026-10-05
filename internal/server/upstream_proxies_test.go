@@ -1,14 +1,16 @@
 package server
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/store"
 )
 
@@ -106,11 +108,15 @@ func TestUpstreamProxyCreateRejectsBadInput(t *testing.T) {
 		{"name too long", `{"name":"` + strings.Repeat("a", 65) + `","scheme":"http","host":"proxy.internal:3128","on_failure":"fail_closed"}`},
 		{"unknown scheme", `{"name":"p","scheme":"ftp","host":"proxy.internal:21","on_failure":"fail_closed"}`},
 		{"missing scheme", `{"name":"p","host":"proxy.internal:3128","on_failure":"fail_closed"}`},
+		{"invalid name", `{"name":"bad/name","scheme":"http","host":"proxy.internal:3128","on_failure":"fail_closed"}`},
 		{"host without port", `{"name":"p","scheme":"http","host":"proxy.internal","on_failure":"fail_closed"}`},
 		{"empty host", `{"name":"p","scheme":"http","host":"","on_failure":"fail_closed"}`},
 		{"non-numeric port", `{"name":"p","scheme":"http","host":"proxy.internal:http","on_failure":"fail_closed"}`},
+		{"port zero", `{"name":"p","scheme":"http","host":"proxy.internal:0","on_failure":"fail_closed"}`},
+		{"port too large", `{"name":"p","scheme":"http","host":"proxy.internal:65536","on_failure":"fail_closed"}`},
 		{"host with userinfo", `{"name":"p","scheme":"http","host":"user:pass@proxy.internal:3128","on_failure":"fail_closed"}`},
 		{"host with path", `{"name":"p","scheme":"http","host":"proxy.internal:3128/relay","on_failure":"fail_closed"}`},
+		{"invalid CA PEM", `{"name":"p","scheme":"http","host":"proxy.internal:3128","proxy_ca_pem":"not a certificate","on_failure":"fail_closed"}`},
 		{"unknown failure policy", `{"name":"p","scheme":"http","host":"proxy.internal:3128","on_failure":"retry"}`},
 		{"invalid json", `{"name":`},
 	}
@@ -138,7 +144,15 @@ func TestUpstreamProxyAcceptsEverySupportedScheme(t *testing.T) {
 			t.Fatalf("create scheme %s = %d, want 201: %s", scheme, rec.Code, rec.Body.String())
 		}
 	}
-	rec := proxyRequest(t, srv, http.MethodGet, "/v1/admin/upstream-proxies", ownerToken, "")
+	rec := proxyRequest(t, srv, http.MethodPost, "/v1/admin/upstream-proxies", ownerToken,
+		`{"name":"normalized","scheme":" HTTPS ","host":"proxy.internal:443","on_failure":"fail_closed"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create with normalized scheme = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := ms.upstreamProxies["normalized"].Scheme; got != "https" {
+		t.Fatalf("stored scheme = %q, want normalized https", got)
+	}
+	rec = proxyRequest(t, srv, http.MethodGet, "/v1/admin/upstream-proxies", ownerToken, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -148,99 +162,215 @@ func TestUpstreamProxyAcceptsEverySupportedScheme(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&listed); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(listed.Proxies) != 4 {
-		t.Fatalf("listed %d proxies, want 4", len(listed.Proxies))
+	if len(listed.Proxies) != 5 {
+		t.Fatalf("listed %d proxies, want 5", len(listed.Proxies))
 	}
 }
 
-func TestUpstreamProxyCredentialsAreEncryptedAndNeverReturned(t *testing.T) {
+func TestUpstreamProxyCredentialsAreWriteOnlyAndPatchedIndependently(t *testing.T) {
 	ms, ownerToken := setupMockStoreWithSession(t)
 	srv := newTestServer(withStore(ms))
 
-	body := `{"name":"corp","scheme":"http","host":"proxy.internal:3128","username":"svc-egress","password":"hunter2","on_failure":"fail_closed"}`
-	rec := proxyRequest(t, srv, http.MethodPost, "/v1/admin/upstream-proxies", ownerToken, body)
+	assertWriteOnly := func(rec *httptest.ResponseRecorder) {
+		t.Helper()
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v (body %s)", err, rec.Body.String())
+		}
+		var profile map[string]json.RawMessage
+		if proxy, ok := body["proxy"]; ok {
+			if err := json.Unmarshal(proxy, &profile); err != nil {
+				t.Fatalf("decode proxy response: %v", err)
+			}
+		} else if proxies, ok := body["proxies"]; ok {
+			var list []map[string]json.RawMessage
+			if err := json.Unmarshal(proxies, &list); err != nil {
+				t.Fatalf("decode proxy list: %v", err)
+			}
+			for _, item := range list {
+				if _, ok := item["username"]; ok {
+					t.Fatalf("proxy list contains username: %s", rec.Body.String())
+				}
+				if _, ok := item["password"]; ok {
+					t.Fatalf("proxy list contains password: %s", rec.Body.String())
+				}
+			}
+		}
+		for _, key := range []string{"username", "password"} {
+			if _, ok := profile[key]; ok {
+				t.Fatalf("response contains %s: %s", key, rec.Body.String())
+			}
+		}
+		for _, secret := range []string{
+			"svc-egress", "hunter2", "new-user", "new-pass", "ignored-user", "ignored-pass",
+			base64.StdEncoding.EncodeToString(ms.upstreamProxies["corp"].UsernameCT),
+			base64.StdEncoding.EncodeToString(ms.upstreamProxies["corp"].PasswordCT),
+		} {
+			if secret != "" && strings.Contains(rec.Body.String(), secret) {
+				t.Fatalf("response leaked secret/ciphertext %q: %s", secret, rec.Body.String())
+			}
+		}
+	}
+
+	rec := proxyRequest(t, srv, http.MethodPost, "/v1/admin/upstream-proxies", ownerToken,
+		`{"name":"corp","scheme":"http","host":"proxy.internal:3128","username":"svc-egress","password":"hunter2","on_failure":"fail_closed","is_default":true}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
 	}
-	created := decodeProxyView(t, rec)
-
-	if created.HasAuth != true {
-		t.Fatal("has_auth = false, want true when credentials are set")
-	}
-	if created.Username != "svc-egress" {
-		t.Fatalf("username = %q, want svc-egress", created.Username)
+	assertWriteOnly(rec)
+	if !decodeProxyView(t, rec).HasAuth {
+		t.Fatal("has_auth = false after creating credentials")
 	}
 
-	raw := rec.Body.String()
-	for _, secret := range []string{"hunter2", "svc-egress"} {
-		if _, ok := map[string]bool{"svc-egress": true}[secret]; ok {
-			continue // the username is operator-readable by design
-		}
-		if strings.Contains(raw, secret) {
-			t.Fatalf("create response leaked %q: %s", secret, raw)
-		}
+	rec = proxyRequest(t, srv, http.MethodGet, "/v1/admin/upstream-proxies/corp", ownerToken, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get = %d: %s", rec.Code, rec.Body.String())
 	}
-
-	stored := ms.upstreamProxies["corp"]
-	if len(stored.PasswordCT) == 0 || len(stored.PasswordNonce) == 0 {
-		t.Fatal("password must be stored encrypted")
-	}
-	if strings.Contains(string(stored.PasswordCT), "hunter2") {
-		t.Fatal("password ciphertext contains the plaintext")
-	}
-
-	// The list and read views must not carry the password either.
-	assertNoPasswordField(t)
+	assertWriteOnly(rec)
 	rec = proxyRequest(t, srv, http.MethodGet, "/v1/admin/upstream-proxies", ownerToken, "")
-	if strings.Contains(rec.Body.String(), "hunter2") {
-		t.Fatalf("list leaked the password: %s", rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
+	}
+	assertWriteOnly(rec)
+
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"username":"new-user"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("username update = %d: %s", rec.Code, rec.Body.String())
+	}
+	assertWriteOnly(rec)
+	got, err := srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
+	if err != nil {
+		t.Fatalf("resolve after username update: %v", err)
+	}
+	if got == nil || got.Username != "new-user" || got.Password != "hunter2" {
+		t.Fatalf("resolved credentials after username update = %#v, want new-user/hunter2", got)
+	}
+
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"password":"new-pass"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("password update = %d: %s", rec.Code, rec.Body.String())
+	}
+	assertWriteOnly(rec)
+	got, err = srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
+	if err != nil {
+		t.Fatalf("resolve after password update: %v", err)
+	}
+	if got == nil || got.Username != "new-user" || got.Password != "new-pass" {
+		t.Fatalf("resolved credentials after password update = %#v, want new-user/new-pass", got)
+	}
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty patch = %d: %s", rec.Code, rec.Body.String())
+	}
+	got, err = srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
+	if err != nil || got == nil || got.Username != "new-user" || got.Password != "new-pass" {
+		t.Fatalf("credentials after empty patch = %#v, err %v; want new-user/new-pass", got, err)
+	}
+
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"username":""}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty username update = %d: %s", rec.Code, rec.Body.String())
+	}
+	got, err = srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
+	if err != nil || got == nil || got.Username != "" || got.Password != "new-pass" {
+		t.Fatalf("credentials after empty username = %#v, err %v; want empty/new-pass", got, err)
+	}
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"password":""}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty password update = %d: %s", rec.Code, rec.Body.String())
+	}
+	got, err = srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
+	if err != nil || got == nil || got.Username != "" || got.Password != "" {
+		t.Fatalf("credentials after empty password = %#v, err %v; want empty/empty", got, err)
+	}
+
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken,
+		`{"username":"ignored-user","password":"ignored-pass","clear_auth":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear_auth update = %d: %s", rec.Code, rec.Body.String())
+	}
+	assertWriteOnly(rec)
+	got, err = srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
+	if err != nil {
+		t.Fatalf("resolve after clear_auth: %v", err)
+	}
+	if got == nil || got.Username != "" || got.Password != "" || decodeProxyView(t, rec).HasAuth {
+		t.Fatalf("credentials after clear_auth = %#v, has_auth=%v; want cleared", got, decodeProxyView(t, rec).HasAuth)
 	}
 }
 
-// assertNoPasswordField guards the wire shape: reintroducing a password field
-// to the view fails here rather than leaking at call time.
-func assertNoPasswordField(t *testing.T) {
-	t.Helper()
-	typ := reflect.TypeOf(proxyView{})
-	for i := 0; i < typ.NumField(); i++ {
-		if strings.Contains(strings.ToLower(typ.Field(i).Tag.Get("json")), "password") {
-			t.Fatalf("proxyView carries a password-bearing field %q; proxy secrets must stay write-only", typ.Field(i).Name)
-		}
-	}
-}
-
-func TestUpstreamProxyRotationKeepsUsernameWhenOnlyPasswordChanges(t *testing.T) {
+func TestUpstreamProxyEmptyCredentialPatchClearsRuntimeAuth(t *testing.T) {
 	ms, ownerToken := setupMockStoreWithSession(t)
 	srv := newTestServer(withStore(ms))
 
 	rec := proxyRequest(t, srv, http.MethodPost, "/v1/admin/upstream-proxies", ownerToken,
-		`{"name":"corp","scheme":"http","host":"proxy.internal:3128","username":"svc-egress","password":"old","on_failure":"fail_closed"}`)
+		`{"name":"corp","scheme":"http","host":"proxy.internal:3128","username":"svc-egress","password":"hunter2","is_default":true}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
 	}
 
-	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"password":"new"}`)
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"username":""}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("rotate = %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("clear username = %d: %s", rec.Code, rec.Body.String())
 	}
-	rotated := decodeProxyView(t, rec)
-	if rotated.Username != "svc-egress" {
-		t.Fatalf("username after password-only rotation = %q, want it preserved", rotated.Username)
+	if strings.Contains(rec.Body.String(), "svc-egress") || strings.Contains(rec.Body.String(), "hunter2") {
+		t.Fatalf("patch response leaked credentials: %s", rec.Body.String())
 	}
-	if !rotated.HasAuth {
-		t.Fatal("has_auth must stay true after rotation")
+	if len(ms.upstreamProxies["corp"].UsernameCT) != 0 || len(ms.upstreamProxies["corp"].PasswordCT) == 0 {
+		t.Fatal("clearing username must remove its ciphertext and preserve password")
+	}
+	runtimeProfile, err := srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
+	if err != nil || runtimeProfile == nil || runtimeProfile.Username != "" || runtimeProfile.Password != "hunter2" {
+		t.Fatalf("runtime credentials after clearing username differ from empty/preserved password: %v", err)
 	}
 
-	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"clear_auth":true}`)
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"password":""}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("clear = %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("clear password = %d: %s", rec.Code, rec.Body.String())
 	}
-	cleared := decodeProxyView(t, rec)
-	if cleared.HasAuth {
-		t.Fatal("has_auth = true after clear_auth, want false")
+	if decodeProxyView(t, rec).HasAuth {
+		t.Fatalf("PATCH has_auth = true after clearing both credentials: %s", rec.Body.String())
 	}
-	if cleared.Username != "" {
-		t.Fatalf("username = %q after clear_auth, want empty", cleared.Username)
+	if strings.Contains(rec.Body.String(), "svc-egress") || strings.Contains(rec.Body.String(), "hunter2") {
+		t.Fatalf("patch response leaked credentials: %s", rec.Body.String())
+	}
+	if len(ms.upstreamProxies["corp"].UsernameCT) != 0 || len(ms.upstreamProxies["corp"].PasswordCT) != 0 {
+		t.Fatal("clearing both credentials must remove both ciphertexts")
+	}
+	runtimeProfile, err = srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
+	if err != nil || runtimeProfile == nil || runtimeProfile.Username != "" || runtimeProfile.Password != "" {
+		t.Fatalf("runtime credentials after clearing both are not empty: %v", err)
+	}
+
+	rec = proxyRequest(t, srv, http.MethodGet, "/v1/admin/upstream-proxies/corp", ownerToken, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET = %d: %s", rec.Code, rec.Body.String())
+	}
+	if decodeProxyView(t, rec).HasAuth {
+		t.Fatalf("GET has_auth = true after clearing both credentials: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "svc-egress") || strings.Contains(rec.Body.String(), "hunter2") {
+		t.Fatalf("GET response leaked credentials: %s", rec.Body.String())
+	}
+}
+
+func TestUpstreamProxyLegacyEncryptedEmptyAuthIsNotReportedAsSet(t *testing.T) {
+	ms, ownerToken := setupMockStoreWithSession(t)
+	srv := newTestServer(withStore(ms))
+	rec := proxyRequest(t, srv, http.MethodPost, "/v1/admin/upstream-proxies", ownerToken,
+		`{"name":"corp","scheme":"http","host":"proxy.internal:3128"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+	}
+	emptyCT, nonce, err := crypto.Encrypt(nil, srv.encKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms.upstreamProxies["corp"].UsernameCT, ms.upstreamProxies["corp"].UsernameNonce = emptyCT, nonce
+	ms.upstreamProxies["corp"].PasswordCT, ms.upstreamProxies["corp"].PasswordNonce = emptyCT, nonce
+	rec = proxyRequest(t, srv, http.MethodGet, "/v1/admin/upstream-proxies/corp", ownerToken, "")
+	if rec.Code != http.StatusOK || decodeProxyView(t, rec).HasAuth {
+		t.Fatalf("legacy empty credentials reported as set: status %d", rec.Code)
 	}
 }
 
@@ -253,10 +383,20 @@ func TestUpstreamProxyUpdateRejectsBadInput(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
 	}
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"scheme":" HTTPS "}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scheme normalization patch = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := ms.upstreamProxies["corp"].Scheme; got != "https" {
+		t.Fatalf("stored scheme after patch = %q, want normalized https", got)
+	}
 
 	for _, tc := range []struct{ name, body string }{
 		{"bad scheme", `{"scheme":"gopher"}`},
 		{"bad host", `{"host":"proxy.internal"}`},
+		{"port outside range", `{"host":"proxy.internal:65536"}`},
+		{"port zero", `{"host":"proxy.internal:0"}`},
+		{"bad CA PEM", `{"proxy_ca_pem":"not a certificate"}`},
 		{"bad failure policy", `{"on_failure":"sometimes"}`},
 		{"invalid json", `{`},
 	} {
@@ -370,6 +510,12 @@ func TestServiceUpstreamProxyReferenceRoundTrip(t *testing.T) {
 		`{"name":"corp","scheme":"http","host":"a.internal:3128","on_failure":"fail_closed"}`); rec.Code != http.StatusCreated {
 		t.Fatalf("create proxy = %d: %s", rec.Code, rec.Body.String())
 	}
+	if err := ms.CreateUpstreamProxy(t.Context(), &store.UpstreamProxy{
+		Name: "default-corp", Scheme: "http", Host: "default.internal:3128",
+		OnFailure: "fail_closed", Enabled: true, IsDefault: true,
+	}); err != nil {
+		t.Fatalf("seed default proxy: %v", err)
+	}
 
 	put := func(body string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodPut, "/v1/vaults/default/services", strings.NewReader(body))
@@ -378,6 +524,16 @@ func TestServiceUpstreamProxyReferenceRoundTrip(t *testing.T) {
 		rec := httptest.NewRecorder()
 		srv.httpServer.Handler.ServeHTTP(rec, r)
 		return rec
+	}
+
+	// A new service without an egress selection must not inherit the default.
+	directWithoutFlag := `{"name":"public","host":"public.example.com","auth":{"type":"passthrough"}}`
+	if rec := put(fmt.Sprintf(`{"services":[%s]}`, directWithoutFlag)); rec.Code != http.StatusOK {
+		t.Fatalf("PUT new direct service = %d: %s", rec.Code, rec.Body.String())
+	}
+	direct, err := srv.UpstreamProxyResolver().ResolveUpstreamProxy(t.Context(), "root-ns-id", "public")
+	if err != nil || direct != nil {
+		t.Fatalf("new service without opt-in resolved %#v, err %v; want direct", direct, err)
 	}
 
 	const service = `{"name":"anthropic","host":"api.anthropic.com","auth":{"type":"bearer","token":"ANTHROPIC_KEY"},"upstream_proxy":"%s"}`
@@ -393,15 +549,69 @@ func TestServiceUpstreamProxyReferenceRoundTrip(t *testing.T) {
 	}
 	var got struct {
 		Services []struct {
-			Name          string `json:"name"`
-			UpstreamProxy string `json:"upstream_proxy"`
+			Name                string `json:"name"`
+			UpstreamProxy       string `json:"upstream_proxy"`
+			BypassUpstreamProxy bool   `json:"bypass_upstream_proxy"`
+			UseUpstreamProxy    bool   `json:"use_upstream_proxy"`
 		} `json:"services"`
 	}
 	if err := json.NewDecoder(getRec.Body).Decode(&got); err != nil {
 		t.Fatalf("decode services: %v", err)
 	}
-	if len(got.Services) != 1 || got.Services[0].UpstreamProxy != "corp" {
-		t.Fatalf("upstream_proxy not persisted: %+v", got.Services)
+	if len(got.Services) != 1 || got.Services[0].UpstreamProxy != "corp" || got.Services[0].BypassUpstreamProxy {
+		t.Fatalf("upstream_proxy not persisted correctly: %+v", got.Services)
+	}
+
+	// Explicitly opt into the instance default, then verify that switching
+	// to direct invalidates the cached route without waiting for its TTL.
+	inheritedService := `{"name":"anthropic","host":"api.anthropic.com","auth":{"type":"bearer","token":"ANTHROPIC_KEY"},"use_upstream_proxy":true}`
+	if rec := put(fmt.Sprintf(`{"services":[%s]}`, inheritedService)); rec.Code != http.StatusOK {
+		t.Fatalf("PUT with default opt-in = %d: %s", rec.Code, rec.Body.String())
+	}
+	resolver := srv.UpstreamProxyResolver()
+	routed, err := resolver.ResolveUpstreamProxy(t.Context(), "root-ns-id", "anthropic")
+	if err != nil || routed == nil || routed.Name != "default-corp" {
+		t.Fatalf("resolve opted-in service before change = %#v, err %v", routed, err)
+	}
+
+	directService := `{"name":"anthropic","host":"api.anthropic.com","auth":{"type":"bearer","token":"ANTHROPIC_KEY"},"bypass_upstream_proxy":true}`
+	if rec := put(fmt.Sprintf(`{"services":[%s]}`, directService)); rec.Code != http.StatusOK {
+		t.Fatalf("PUT with service direct bypass = %d: %s", rec.Code, rec.Body.String())
+	}
+	routed, err = resolver.ResolveUpstreamProxy(t.Context(), "root-ns-id", "anthropic")
+	if err != nil || routed != nil {
+		t.Fatalf("resolve service after direct change = %#v, err %v; want nil", routed, err)
+	}
+	getRec = proxyRequest(t, srv, http.MethodGet, "/v1/vaults/default/services", ownerToken, "")
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET services after direct bypass = %d: %s", getRec.Code, getRec.Body.String())
+	}
+	got.Services = nil
+	if err := json.NewDecoder(getRec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode services after direct bypass: %v", err)
+	}
+	if len(got.Services) != 1 || !got.Services[0].BypassUpstreamProxy || got.Services[0].UpstreamProxy != "" {
+		t.Fatalf("bypass_upstream_proxy not persisted: %+v", got.Services)
+	}
+	if rec := put(fmt.Sprintf(`{"services":[%s]}`, inheritedService)); rec.Code != http.StatusOK {
+		t.Fatalf("PUT removing direct bypass = %d: %s", rec.Code, rec.Body.String())
+	}
+	routed, err = resolver.ResolveUpstreamProxy(t.Context(), "root-ns-id", "anthropic")
+	if err != nil || routed == nil || routed.Name != "default-corp" {
+		t.Fatalf("resolve after removing direct bypass = %#v, err %v; want instance default", routed, err)
+	}
+	getRec = proxyRequest(t, srv, http.MethodGet, "/v1/vaults/default/services", ownerToken, "")
+	got.Services = nil
+	if err := json.NewDecoder(getRec.Body).Decode(&got); err != nil || len(got.Services) != 1 || !got.Services[0].UseUpstreamProxy {
+		t.Fatalf("default opt-in not persisted: %+v, err %v", got.Services, err)
+	}
+
+	conflict := `{"name":"anthropic","host":"api.anthropic.com","auth":{"type":"bearer","token":"ANTHROPIC_KEY"},"bypass_upstream_proxy":true,"upstream_proxy":"corp"}`
+	if rec := put(fmt.Sprintf(`{"services":[%s]}`, conflict)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("PUT with conflicting egress controls = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if rec := put(fmt.Sprintf(`{"services":[%s]}`, `{"name":"anthropic","host":"api.anthropic.com","auth":{"type":"bearer","token":"ANTHROPIC_KEY"},"use_upstream_proxy":true,"upstream_proxy":"corp"}`)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("PUT with default and named profile = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
 
 	rec := put(fmt.Sprintf(`{"services":[%s]}`, fmt.Sprintf(service, "no-such-proxy")))
@@ -410,6 +620,43 @@ func TestServiceUpstreamProxyReferenceRoundTrip(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "no-such-proxy") {
 		t.Fatalf("400 must name the unknown profile: %s", rec.Body.String())
+	}
+}
+
+func TestNewServiceDirectDoesNotRerouteExistingImplicitDefault(t *testing.T) {
+	ms, ownerToken := setupMockStoreWithSession(t)
+	seedProxy(t, ms, "default-corp", "http", "default.internal:3128", true, true)
+	legacy := `[{"name":"legacy","host":"legacy.example.com","auth":{"type":"passthrough"}}]`
+	if _, err := ms.SetBrokerConfig(t.Context(), "root-ns-id", legacy); err != nil {
+		t.Fatal(err)
+	}
+	srv := newTestServer(withStore(ms))
+	body := `{"services":[{"name":"legacy","host":"legacy.example.com","auth":{"type":"passthrough"}},{"name":"fresh","host":"fresh.example.com","auth":{"type":"passthrough"}}]}`
+	rec := proxyRequest(t, srv, http.MethodPut, "/v1/vaults/default/services", ownerToken, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT mixed legacy and new services = %d: %s", rec.Code, rec.Body.String())
+	}
+	resolver := srv.UpstreamProxyResolver()
+	legacyRoute, err := resolver.ResolveUpstreamProxy(t.Context(), "root-ns-id", "legacy")
+	if err != nil || legacyRoute == nil || legacyRoute.Name != "default-corp" {
+		t.Fatalf("legacy route = %#v, err %v; want inherited default", legacyRoute, err)
+	}
+	freshRoute, err := resolver.ResolveUpstreamProxy(t.Context(), "root-ns-id", "fresh")
+	if err != nil || freshRoute != nil {
+		t.Fatalf("new route = %#v, err %v; want direct", freshRoute, err)
+	}
+	rec = proxyRequest(t, srv, http.MethodPost, "/v1/vaults/default/services", ownerToken,
+		`{"services":[{"name":"post-added","host":"post.example.com","auth":{"type":"passthrough"}}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST new service = %d: %s", rec.Code, rec.Body.String())
+	}
+	postRoute, err := resolver.ResolveUpstreamProxy(t.Context(), "root-ns-id", "post-added")
+	if err != nil || postRoute != nil {
+		t.Fatalf("POST new route = %#v, err %v; want direct", postRoute, err)
+	}
+	legacyRoute, err = resolver.ResolveUpstreamProxy(t.Context(), "root-ns-id", "legacy")
+	if err != nil || legacyRoute == nil || legacyRoute.Name != "default-corp" {
+		t.Fatalf("legacy route after POST = %#v, err %v; want inherited default", legacyRoute, err)
 	}
 }
 

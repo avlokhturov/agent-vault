@@ -24,10 +24,13 @@ package egress
 
 import (
 	"bufio"
+	"bytes"
+	"container/list"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -69,6 +72,9 @@ func Validate(p *brokercore.UpstreamProxy) error {
 		return fmt.Errorf("egress: unsupported failure policy %q", p.OnFailure)
 	}
 	if err := ValidateHost(p.Host); err != nil {
+		return err
+	}
+	if err := ValidateProxyCAPEM(p.ProxyCAPEM); err != nil {
 		return err
 	}
 	return nil
@@ -151,6 +157,59 @@ func Bypass(noProxy, target string) bool {
 	return false
 }
 
+// TargetAddr returns the host:port used for target policy and NO_PROXY
+// matching without modifying the request URL or its Host header.
+func TargetAddr(u *url.URL) (string, error) {
+	if u == nil {
+		return "", fmt.Errorf("egress: nil target URL")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("egress: target URL has no host")
+	}
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		default:
+			return "", fmt.Errorf("egress: target URL has unsupported scheme %q", u.Scheme)
+		}
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// ValidateProxyCAPEM accepts empty configuration or one or more valid PEM
+// certificates; malformed non-empty data is a configuration error.
+func ValidateProxyCAPEM(pemText string) error {
+	if strings.TrimSpace(pemText) == "" {
+		return nil
+	}
+	rest := []byte(pemText)
+	count := 0
+	for len(rest) > 0 {
+		rest = bytes.TrimSpace(rest)
+		if len(rest) == 0 {
+			break
+		}
+		block, next := pem.Decode(rest)
+		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			return fmt.Errorf("egress: invalid proxy CA PEM")
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			return fmt.Errorf("egress: invalid proxy CA certificate: %w", err)
+		}
+		count++
+		rest = next
+	}
+	if count == 0 {
+		return fmt.Errorf("egress: invalid proxy CA PEM")
+	}
+	return nil
+}
+
 // TunnelDialer opens a raw tunneled connection to addr. It is the WebSocket
 // counterpart of the HTTP transport: where RoundTrip can rely on net/http's
 // own CONNECT handling, hijacked upgrades need the bare net.Conn.
@@ -162,18 +221,25 @@ type TunnelDialer func(ctx context.Context, network, addr string) (net.Conn, err
 // sizing. Returned transports are owned by the Registry after construction.
 type TransportFactory func() *http.Transport
 
-// Registry caches transports and tunnel dialers per resolved profile so the
-// hot path performs no allocation, no crypto, and no config parsing. Keys are
-// profile fingerprints: editing a profile produces a new key, which makes
-// changes take effect immediately without restarting the server.
+const maxCachedProfiles = 128
+
+type registryEntry struct {
+	name        string
+	fingerprint string
+	transport   *http.Transport
+	tunnel      TunnelDialer
+	element     *list.Element
+}
+
+// Registry retains one profile generation per stable profile name.
 type Registry struct {
 	base     TransportFactory
 	logger   *slog.Logger
-	validate bool // apply netguard target policy before handing off
+	validate bool
 
-	mu         sync.RWMutex
-	transports map[string]*http.Transport
-	tunnels    map[string]TunnelDialer
+	mu      sync.Mutex
+	entries map[string]*registryEntry
+	lru     list.List
 }
 
 // NewRegistry wraps factory-built transports configured by profile. When
@@ -183,17 +249,12 @@ func NewRegistry(factory TransportFactory, logger *slog.Logger, validate bool) *
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Registry{
-		base:       factory,
-		logger:     logger,
-		validate:   validate,
-		transports: make(map[string]*http.Transport),
-		tunnels:    make(map[string]TunnelDialer),
-	}
+	return &Registry{base: factory, logger: logger, validate: validate, entries: make(map[string]*registryEntry)}
 }
 
-// Transport returns the transport to use for requests carried by profile p.
-// Results are cached; the returned value must not be mutated by callers.
+// Transport returns the proxy-hop transport for profile p. Callers must select
+// their direct transport before using it for a NO_PROXY target. The proxy hook
+// rejects a missed bypass instead of treating a target as the proxy endpoint.
 func (r *Registry) Transport(p *brokercore.UpstreamProxy) (*http.Transport, error) {
 	if p == nil {
 		return nil, fmt.Errorf("egress: nil profile")
@@ -201,30 +262,25 @@ func (r *Registry) Transport(p *brokercore.UpstreamProxy) (*http.Transport, erro
 	if err := Validate(p); err != nil {
 		return nil, err
 	}
-	key := p.Fingerprint()
-
-	r.mu.RLock()
-	cached := r.transports[key]
-	r.mu.RUnlock()
-	if cached != nil {
-		return cached, nil
-	}
-
+	profile := *p
+	key := profile.Fingerprint()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if cached := r.transports[key]; cached != nil {
-		return cached, nil
+	entry := r.entries[profile.Name]
+	if entry != nil && entry.fingerprint == key && entry.transport != nil {
+		r.touch(entry)
+		return entry.transport, nil
 	}
-	tr, err := r.buildTransport(p)
+	tr, err := r.buildTransport(&profile)
 	if err != nil {
 		return nil, err
 	}
-	r.transports[key] = tr
+	entry = r.replace(profile.Name, key, entry)
+	entry.transport = tr
 	return tr, nil
 }
 
-// Tunnel returns a dialer that establishes a tunneled TCP connection to the
-// upstream through profile p, used by hijacked WebSocket upgrades.
+// Tunnel returns a dialer that establishes a tunneled TCP connection through p.
 func (r *Registry) Tunnel(p *brokercore.UpstreamProxy) (TunnelDialer, error) {
 	if p == nil {
 		return nil, fmt.Errorf("egress: nil profile")
@@ -232,34 +288,63 @@ func (r *Registry) Tunnel(p *brokercore.UpstreamProxy) (TunnelDialer, error) {
 	if err := Validate(p); err != nil {
 		return nil, err
 	}
-	key := p.Fingerprint()
-
-	r.mu.RLock()
-	cached := r.tunnels[key]
-	r.mu.RUnlock()
-	if cached != nil {
-		return cached, nil
-	}
-
+	profile := *p
+	key := profile.Fingerprint()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if cached := r.tunnels[key]; cached != nil {
-		return cached, nil
+	entry := r.entries[profile.Name]
+	if entry != nil && entry.fingerprint == key && entry.tunnel != nil {
+		r.touch(entry)
+		return entry.tunnel, nil
 	}
-	dialer, err := r.buildTunnel(p)
+	dialer, err := r.buildTunnel(&profile)
 	if err != nil {
 		return nil, err
 	}
-	r.tunnels[key] = dialer
+	entry = r.replace(profile.Name, key, entry)
+	entry.tunnel = dialer
 	return dialer, nil
 }
 
+func (r *Registry) replace(name, fingerprint string, entry *registryEntry) *registryEntry {
+	if entry != nil && entry.fingerprint != fingerprint {
+		if entry.transport != nil {
+			entry.transport.CloseIdleConnections()
+		}
+		entry.fingerprint = fingerprint
+		entry.transport = nil
+		entry.tunnel = nil
+		r.lru.MoveToFront(entry.element)
+		return entry
+	}
+	if entry != nil {
+		r.touch(entry)
+		return entry
+	}
+	entry = &registryEntry{name: name, fingerprint: fingerprint}
+	entry.element = r.lru.PushFront(entry)
+	r.entries[name] = entry
+	if len(r.entries) > maxCachedProfiles {
+		oldest := r.lru.Back().Value.(*registryEntry)
+		if oldest.transport != nil {
+			oldest.transport.CloseIdleConnections()
+		}
+		delete(r.entries, oldest.name)
+		r.lru.Remove(oldest.element)
+	}
+	return entry
+}
+
+func (r *Registry) touch(entry *registryEntry) { r.lru.MoveToFront(entry.element) }
+
 // CloseIdleConnections drops pooled connections for every cached transport.
 func (r *Registry) CloseIdleConnections() {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	for _, tr := range r.transports {
-		tr.CloseIdleConnections()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, entry := range r.entries {
+		if entry.transport != nil {
+			entry.transport.CloseIdleConnections()
+		}
 	}
 }
 
@@ -299,12 +384,12 @@ func (r *Registry) buildTransport(p *brokercore.UpstreamProxy) (*http.Transport,
 // is on the direct path.
 func (r *Registry) applyHTTPProxy(tr *http.Transport, p *brokercore.UpstreamProxy, proxyURL *url.URL) {
 	tr.Proxy = func(req *http.Request) (*url.URL, error) {
-		target := req.URL.Host
+		target, err := TargetAddr(req.URL)
+		if err != nil {
+			return nil, err
+		}
 		if Bypass(p.NoProxy, target) {
-			r.logger.Debug("bypassing upstream proxy for no_proxy host",
-				slog.String("host", target),
-				slog.String("profile", p.Name))
-			return nil, nil
+			return nil, fmt.Errorf("egress: no_proxy target %q requires the direct transport", target)
 		}
 		if r.validate {
 			if err := netguard.ValidateTargetAddr(req.Context(), target); err != nil {
@@ -321,11 +406,10 @@ func (r *Registry) applyHTTPProxy(tr *http.Transport, p *brokercore.UpstreamProx
 			"Proxy-Authorization": []string{"Basic " + auth},
 		}
 	}
-	tr.DialContext = r.proxyOrDirect(p)
-	// net/http handshakes to an https proxy through DialTLSContext and keeps
-	// verifying the *target* with TLSClientConfig, so installing this hook
-	// lets the proxy trust anchor stay separate from the upstream's.
-	tr.DialTLSContext = r.tlsDial(p, tr.TLSClientConfig)
+	tr.DialContext = r.proxyTCP(p)
+	// DialTLSContext is used for the HTTPS proxy hop; net/http verifies the
+	// target after CONNECT against the transport's own TLSClientConfig.
+	tr.DialTLSContext = r.tlsDial(p)
 }
 
 // proxyTCP returns a hook that opens a plain TCP connection to the proxy
@@ -359,8 +443,10 @@ func (r *Registry) dialProxyHop(p *brokercore.UpstreamProxy) func(ctx context.Co
 		if p.Scheme != brokercore.UpstreamProxySchemeHTTPS {
 			return conn, nil
 		}
+		handshakeCtx, cancel := context.WithTimeout(ctx, proxyDialTimeout)
+		defer cancel()
 		tlsConn := tls.Client(conn, proxyTLS.Clone())
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
+		if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("%w: TLS handshake with profile %q (%s): %w", ErrProxyUnreachable, p.Name, p.Host, err)
 		}
@@ -382,59 +468,24 @@ func (r *Registry) proxyTLSConfig(p *brokercore.UpstreamProxy) *tls.Config {
 	return cfg
 }
 
-// proxyOrDirect adapts dialProxyHop for Transport.DialContext. When the
-// Proxy hook declined (a no_proxy hit) net/http asks for the *target*
-// address, and those requests must reach the network directly rather than
-// being spoken to through the proxy — under the policy the un-proxied path
-// would apply.
-func (r *Registry) proxyOrDirect(p *brokercore.UpstreamProxy) func(ctx context.Context, network, addr string) (net.Conn, error) {
+// tlsDial authenticates only the TLS connection to an HTTPS proxy. Targets
+// reached through CONNECT are authenticated by net/http with TLSClientConfig.
+// A no_proxy target never enters this transport, even if its address equals
+// the configured proxy endpoint.
+func (r *Registry) tlsDial(p *brokercore.UpstreamProxy) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	hop := r.proxyTCP(p)
-	direct := &net.Dialer{Timeout: proxyDialTimeout, KeepAlive: 30 * time.Second}
-
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if addr == p.Host {
-			return hop(ctx, network, addr)
-		}
-		if r.validate {
-			if err := netguard.ValidateTargetAddr(ctx, addr); err != nil {
-				return nil, err
-			}
-		}
-		return direct.DialContext(ctx, network, addr)
-	}
-}
-
-// tlsDial provides the hop-level TLS handshake, mirroring what net/http does
-// internally when no custom dialer is installed. Only the hop to the proxy
-// changes: it is verified against the profile's pinned CA instead of the
-// pool the upstream certificates are validated with. Targets — including
-// targets reached through CONNECT — keep using the transport's own
-// TLSClientConfig, so installing an egress proxy never widens trust in the
-// upstream.
-func (r *Registry) tlsDial(p *brokercore.UpstreamProxy, target *tls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	hop := r.proxyOrDirect(p)
-
+	proxyTLS := r.proxyTLSConfig(p)
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, err := hop(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
-		cfg := &tls.Config{MinVersion: tls.VersionTLS12}
-		switch {
-		case addr == p.Host:
-			cfg = r.proxyTLSConfig(p)
-		case target != nil:
-			cfg = target.Clone()
-		}
-		if cfg.ServerName == "" {
-			if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil {
-				cfg.ServerName = host
-			}
-		}
-		tlsConn := tls.Client(conn, cfg)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
+		tlsConn := tls.Client(conn, proxyTLS)
+		handshakeCtx, cancel := context.WithTimeout(ctx, proxyDialTimeout)
+		defer cancel()
+		if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
 			_ = conn.Close()
-			return nil, fmt.Errorf("egress: TLS handshake with %q: %w", addr, err)
+			return nil, fmt.Errorf("%w: TLS handshake with proxy %q: %w", ErrProxyUnreachable, p.Name, err)
 		}
 		return tlsConn, nil
 	}
@@ -460,7 +511,7 @@ func rootPool(pem string) *x509.CertPool {
 // socksDialer builds a SOCKS5 dialer from the profile, using x/net/proxy for
 // the handshake (greeting, optional username/password sub-negotiation, and
 // the request/reply exchange).
-func (r *Registry) socksDialer(p *brokercore.UpstreamProxy) (proxy.Dialer, error) {
+func (r *Registry) socksDialer(p *brokercore.UpstreamProxy) (proxy.ContextDialer, error) {
 	var auth *proxy.Auth
 	if p.HasAuth() {
 		auth = &proxy.Auth{User: p.Username, Password: p.Password}
@@ -469,7 +520,11 @@ func (r *Registry) socksDialer(p *brokercore.UpstreamProxy) (proxy.Dialer, error
 	if err != nil {
 		return nil, fmt.Errorf("egress: building socks5 dialer for profile %q: %w", p.Name, err)
 	}
-	return dialer, nil
+	contextDialer, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		return nil, fmt.Errorf("egress: SOCKS dialer for profile %q does not support context", p.Name)
+	}
+	return contextDialer, nil
 }
 
 // proxyHopDialer is the "how do I reach the proxy" half of a SOCKS profile.
@@ -502,42 +557,66 @@ func (d *hopDialer) DialContext(ctx context.Context, network, addr string) (net.
 	return d.dial(ctx, network, addr)
 }
 
-// wrapTargetPolicy adapts a legacy single-flight SOCKS dialer to the
-// context-aware hook net/http expects, applying network policy to the target
-// first. Cancellation is cooperative: a cancelled context returns
-// immediately while the in-flight dial is abandoned and closed by the caller.
-func (r *Registry) wrapTargetPolicy(p *brokercore.UpstreamProxy, dialer proxy.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
+// wrapTargetPolicy resolves and validates targets before sending them through
+// SOCKS. SOCKS5 sends checked numeric addresses; SOCKS5H preserves the name
+// after local preflight validation.
+func (r *Registry) wrapTargetPolicy(p *brokercore.UpstreamProxy, dialer proxy.ContextDialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if r.validate {
-			if err := netguard.ValidateTargetAddr(ctx, addr); err != nil {
+		dialCtx, cancel := context.WithTimeout(ctx, proxyDialTimeout)
+		defer cancel()
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("egress: invalid SOCKS target %q: %w", addr, err)
+		}
+		var targets []string
+		if p.Scheme == brokercore.UpstreamProxySchemeSOCKS5 {
+			var ips []net.IPAddr
+			if r.validate {
+				ips, err = netguard.ResolveTargetIPs(dialCtx, host)
+			} else {
+				ips, err = net.DefaultResolver.LookupIPAddr(dialCtx, host)
+				if err == nil && len(ips) == 0 {
+					err = fmt.Errorf("egress: DNS lookup returned no addresses for %q", host)
+				}
+			}
+			if err != nil {
 				return nil, err
 			}
-		}
-		type result struct {
-			conn net.Conn
-			err  error
-		}
-		done := make(chan result, 1)
-		go func() {
-			conn, err := dialer.Dial(network, addr)
-			done <- result{conn: conn, err: err}
-		}()
-		select {
-		case <-ctx.Done():
-			// Close late arrivals so a slow proxy can't leak a socket.
-			go func() {
-				res := <-done
-				if res.conn != nil {
-					_ = res.conn.Close()
-				}
-			}()
-			return nil, ctx.Err()
-		case res := <-done:
-			if res.err != nil {
-				return nil, fmt.Errorf("egress: socks dial via profile %q: %w", p.Name, res.err)
+			for _, ip := range ips {
+				targets = append(targets, net.JoinHostPort(ip.IP.String(), port))
 			}
-			return res.conn, nil
+		} else {
+			if r.validate {
+				err = netguard.ValidateRemoteTargetName(dialCtx, host)
+			} else if ip := net.ParseIP(host); ip == nil {
+				ips, lookupErr := net.DefaultResolver.LookupIPAddr(dialCtx, host)
+				if lookupErr != nil {
+					var dnsErr *net.DNSError
+					if !(errors.As(lookupErr, &dnsErr) && dnsErr.IsNotFound && ctx.Err() == nil) {
+						return nil, lookupErr
+					}
+				} else if len(ips) == 0 {
+					return nil, fmt.Errorf("egress: DNS lookup returned no addresses for %q", host)
+				}
+			}
+			if err != nil {
+				return nil, err
+			}
+			targets = []string{addr}
 		}
+
+		var lastErr error
+		for _, target := range targets {
+			conn, dialErr := dialer.DialContext(dialCtx, network, target)
+			if dialErr == nil {
+				return conn, nil
+			}
+			lastErr = fmt.Errorf("egress: socks dial via profile %q: %w", p.Name, dialErr)
+			if dialCtx.Err() != nil || errors.Is(dialErr, ErrProxyUnreachable) {
+				return nil, lastErr
+			}
+		}
+		return nil, lastErr
 	}
 }
 
@@ -568,11 +647,12 @@ func (r *Registry) buildTunnel(p *brokercore.UpstreamProxy) (TunnelDialer, error
 			if err != nil {
 				return nil, err
 			}
-			if err := connectTunnel(ctx, conn, addr, p); err != nil {
+			tunneled, err := connectTunnel(ctx, conn, addr, p)
+			if err != nil {
 				_ = conn.Close()
 				return nil, err
 			}
-			return conn, nil
+			return tunneled, nil
 		}, nil
 
 	default:
@@ -580,34 +660,66 @@ func (r *Registry) buildTunnel(p *brokercore.UpstreamProxy) (TunnelDialer, error
 	}
 }
 
-// connectTunnel issues CONNECT over an existing connection to the proxy and
-// consumes the response. Authentication mirrors net/http's behaviour: the
-// Proxy-Authorization header travels in the CONNECT request and never reaches
-// the upstream.
-func connectTunnel(ctx context.Context, conn net.Conn, addr string, p *brokercore.UpstreamProxy) error {
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-		defer func() { _ = conn.SetDeadline(time.Time{}) }()
+// connectTunnel issues CONNECT and preserves bytes already read beyond the
+// response headers for the caller of the successful tunnel.
+func connectTunnel(ctx context.Context, conn net.Conn, addr string, p *brokercore.UpstreamProxy) (net.Conn, error) {
+	deadline := time.Now().Add(proxyDialTimeout)
+	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
 	}
-	var sb strings.Builder
-	_, _ = sb.WriteString("CONNECT " + addr + " HTTP/1.1\r\n")
-	_, _ = sb.WriteString("Host: " + addr + "\r\n")
-	if p.HasAuth() {
-		auth := base64.StdEncoding.EncodeToString([]byte(p.Username + ":" + p.Password))
-		_, _ = sb.WriteString("Proxy-Authorization: Basic " + auth + "\r\n")
+	if err := conn.SetDeadline(deadline); err != nil {
+		return nil, err
 	}
-	_, _ = sb.WriteString("\r\n")
-	if _, err := conn.Write([]byte(sb.String())); err != nil {
-		return fmt.Errorf("egress: writing CONNECT to proxy %q: %w", p.Name, err)
+	callbackDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(callbackDone)
+	})
+	reader := bufio.NewReader(conn)
+	handshakeErr := func() error {
+		var sb strings.Builder
+		_, _ = sb.WriteString("CONNECT " + addr + " HTTP/1.1\r\n")
+		_, _ = sb.WriteString("Host: " + addr + "\r\n")
+		if p.HasAuth() {
+			auth := base64.StdEncoding.EncodeToString([]byte(p.Username + ":" + p.Password))
+			_, _ = sb.WriteString("Proxy-Authorization: Basic " + auth + "\r\n")
+		}
+		_, _ = sb.WriteString("\r\n")
+		if _, err := conn.Write([]byte(sb.String())); err != nil {
+			return fmt.Errorf("egress: writing CONNECT to proxy %q: %w", p.Name, err)
+		}
+		resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+		if err != nil {
+			return fmt.Errorf("egress: reading CONNECT response from proxy %q: %w", p.Name, err)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			_ = resp.Body.Close()
+			return fmt.Errorf("egress: proxy %q refused CONNECT with status %d", p.Name, resp.StatusCode)
+		}
+		return nil
+	}()
+	if !stop() {
+		<-callbackDone
 	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
-	if err != nil {
-		return fmt.Errorf("egress: reading CONNECT response from proxy %q: %w", p.Name, err)
+	if ctx.Err() != nil {
+		_ = conn.Close()
+		return nil, ctx.Err()
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("egress: proxy %q refused CONNECT with status %d", p.Name, resp.StatusCode)
+	if handshakeErr != nil {
+		return nil, handshakeErr
 	}
-	return nil
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+	if reader.Buffered() != 0 {
+		return &bufferedConn{Conn: conn, reader: reader}, nil
+	}
+	return conn, nil
 }
+
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }

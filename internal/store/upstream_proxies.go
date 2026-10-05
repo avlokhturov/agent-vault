@@ -79,11 +79,15 @@ func (s *SQLStore) CreateUpstreamProxy(ctx context.Context, p *UpstreamProxy) er
 
 	// Only one profile can be the instance default; clear the previous one in
 	// the same transaction so two defaults can never race into existence.
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, s.upstreamProxyTxOptions())
 	if err != nil {
 		return fmt.Errorf("CreateUpstreamProxy: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	if err := s.lockUpstreamProxyState(ctx, tx); err != nil {
+		return fmt.Errorf("CreateUpstreamProxy: locking proxy state: %w", err)
+	}
 
 	if p.IsDefault {
 		if _, err := tx.ExecContext(ctx,
@@ -92,6 +96,7 @@ func (s *SQLStore) CreateUpstreamProxy(ctx context.Context, p *UpstreamProxy) er
 			return fmt.Errorf("CreateUpstreamProxy: clearing previous default: %w", err)
 		}
 	}
+	// The transaction-wide reservation serializes default changes.
 
 	if _, err := tx.ExecContext(ctx, s.dialect.Rebind(`INSERT INTO upstream_proxies (
 		id, name, scheme, host, username_ct, username_nonce, password_ct, password_nonce,
@@ -110,11 +115,15 @@ func (s *SQLStore) UpdateUpstreamProxy(ctx context.Context, params UpdateUpstrea
 		return nil, fmt.Errorf("UpdateUpstreamProxy: name is required")
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, s.upstreamProxyTxOptions())
 	if err != nil {
 		return nil, fmt.Errorf("UpdateUpstreamProxy: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	if err := s.lockUpstreamProxyState(ctx, tx); err != nil {
+		return nil, fmt.Errorf("UpdateUpstreamProxy: locking proxy state: %w", err)
+	}
 
 	existing, err := s.getUpstreamProxyTx(ctx, tx, params.Name)
 	if err != nil {
@@ -191,7 +200,25 @@ func (s *SQLStore) UpdateUpstreamProxy(ctx context.Context, params UpdateUpstrea
 }
 
 func (s *SQLStore) DeleteUpstreamProxy(ctx context.Context, name string) error {
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, s.upstreamProxyTxOptions())
+	if err != nil {
+		return fmt.Errorf("DeleteUpstreamProxy: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.lockUpstreamProxyState(ctx, tx); err != nil {
+		return fmt.Errorf("DeleteUpstreamProxy: locking proxy state: %w", err)
+	}
+	if _, err := s.getUpstreamProxyTx(ctx, tx, name); err != nil {
+		return err
+	}
+	refs, err := s.countUpstreamProxyReferences(ctx, tx, name)
+	if err != nil {
+		return err
+	}
+	if len(refs) != 0 {
+		return &UpstreamProxyReferencedError{Name: name, References: refs}
+	}
+	res, err := tx.ExecContext(ctx,
 		s.dialect.Rebind("DELETE FROM upstream_proxies WHERE name = ?"), name)
 	if err != nil {
 		return fmt.Errorf("DeleteUpstreamProxy: %w", err)
@@ -203,7 +230,17 @@ func (s *SQLStore) DeleteUpstreamProxy(ctx context.Context, name string) error {
 	if affected == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+	return tx.Commit()
+}
+
+// UpstreamProxyReferencedError reports service references that prevent deletion.
+type UpstreamProxyReferencedError struct {
+	Name       string
+	References []string
+}
+
+func (e *UpstreamProxyReferencedError) Error() string {
+	return fmt.Sprintf("upstream proxy %q is referenced", e.Name)
 }
 
 // CountUpstreamProxyReferences scans every vault's broker config for services
@@ -211,30 +248,96 @@ func (s *SQLStore) DeleteUpstreamProxy(ctx context.Context, name string) error {
 // Vault stores services as JSON, so this is a scan by necessity — profiles are
 // few and the check happens only on delete.
 func (s *SQLStore) CountUpstreamProxyReferences(ctx context.Context, name string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx,
+	return s.countUpstreamProxyReferences(ctx, s.db, name)
+}
+
+type sqlQueryer interface {
+	QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+}
+
+func (s *SQLStore) countUpstreamProxyReferences(ctx context.Context, q sqlQueryer, name string) ([]string, error) {
+	rows, err := q.QueryContext(ctx,
 		"SELECT bc.vault_id, v.name, bc.services_json FROM broker_configs bc JOIN vaults v ON v.id = bc.vault_id")
 	if err != nil {
 		return nil, fmt.Errorf("counting upstream proxy references: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
 	var refs []string
 	for rows.Next() {
 		var vaultID, vaultName, servicesJSON string
 		if err := rows.Scan(&vaultID, &vaultName, &servicesJSON); err != nil {
+			_ = rows.Close()
 			return nil, fmt.Errorf("scanning broker config: %w", err)
 		}
 		var services []broker.Service
 		if err := json.Unmarshal([]byte(servicesJSON), &services); err != nil {
-			continue
+			_ = rows.Close()
+			return nil, fmt.Errorf("decoding services for vault %q: %w", vaultName, err)
 		}
 		for _, svc := range services {
-			if strings.EqualFold(svc.UpstreamProxy, name) {
+			if svc.UpstreamProxy == name {
 				refs = append(refs, fmt.Sprintf("%s/%s", vaultName, svc.Name))
 			}
 		}
 	}
-	return refs, rows.Err()
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("scanning broker configs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("closing broker configs: %w", err)
+	}
+	return refs, nil
+}
+
+// UnknownUpstreamProxyError identifies a service that names no configured profile.
+type UnknownUpstreamProxyError struct{ Name string }
+
+func (e *UnknownUpstreamProxyError) Error() string {
+	return fmt.Sprintf("unknown upstream proxy %q", e.Name)
+}
+
+func (s *SQLStore) validateUpstreamProxyRefsTx(ctx context.Context, tx *sql.Tx, servicesJSON string) error {
+	var services []broker.Service
+	if err := json.Unmarshal([]byte(servicesJSON), &services); err != nil {
+		return fmt.Errorf("decoding services JSON: %w", err)
+	}
+	seen := make(map[string]struct{})
+	for _, svc := range services {
+		name := strings.TrimSpace(svc.UpstreamProxy)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		var exists int
+		err := tx.QueryRowContext(ctx, s.dialect.Rebind("SELECT 1 FROM upstream_proxies WHERE name = ?"), name).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return &UnknownUpstreamProxyError{Name: name}
+		}
+		if err != nil {
+			return fmt.Errorf("checking upstream proxy %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func (s *SQLStore) upstreamProxyTxOptions() *sql.TxOptions {
+	if s.dialect.Name() == "postgres" {
+		return &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+	}
+	return nil
+}
+
+func (s *SQLStore) lockUpstreamProxyState(ctx context.Context, tx *sql.Tx) error {
+	if s.dialect.Name() == "postgres" {
+		_, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(1096175702, 1)")
+		return err
+	}
+	_, err := tx.ExecContext(ctx, "UPDATE upstream_proxies SET name = name WHERE 1 = 0")
+	return err
 }
 
 func (s *SQLStore) getUpstreamProxyTx(ctx context.Context, tx *sql.Tx, name string) (*UpstreamProxy, error) {

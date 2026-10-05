@@ -1,11 +1,9 @@
 package mitm
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -30,24 +28,24 @@ type upstreamRoute struct {
 // routeFor resolves the egress route for one brokered request. host is the
 // upstream address in host:port form and is used for NO_PROXY matching.
 //
-// Errors are returned only when a profile exists, applies to this request,
-// cannot be turned into a dialler, and is not configured to fail open. Every
-// other outcome (no resolver, no profile, no_proxy hit, resolver failure)
-// degrades to a direct connection so availability never depends on the
-// configuration being perfect.
+// Errors from resolution and construction are closed failures; only an
+// explicit nil profile selects the baseline direct transport.
 func (p *Proxy) routeFor(ctx context.Context, vaultID, serviceName, host string) (upstreamRoute, error) {
 	direct := upstreamRoute{transport: p.upstream}
-	if p.upstreamRes == nil || p.egress == nil {
+	if p.upstreamRes == nil {
 		return direct, nil
+	}
+	if p.egress == nil {
+		return upstreamRoute{}, fmt.Errorf("upstream proxy registry is unavailable")
 	}
 
 	profile, err := p.upstreamRes.ResolveUpstreamProxy(ctx, vaultID, serviceName)
 	if err != nil {
-		p.logger.Warn("upstream proxy resolution failed; dialling upstream directly",
+		p.logger.Warn("upstream proxy resolution failed",
 			slog.String("vault_id", vaultID),
 			slog.String("service", serviceName),
 			slog.String("error", err.Error()))
-		return direct, nil
+		return upstreamRoute{}, fmt.Errorf("upstream proxy resolution failed")
 	}
 	if profile == nil {
 		return direct, nil
@@ -70,10 +68,7 @@ func (p *Proxy) routeFor(ctx context.Context, vaultID, serviceName, host string)
 			slog.String("profile", profile.Name),
 			slog.String("scheme", profile.Scheme),
 			slog.String("error", buildErr.Error()))
-		if profile.FailureMode() == brokercore.UpstreamProxyFailOpen {
-			return direct, nil
-		}
-		return upstreamRoute{}, fmt.Errorf("upstream proxy %q is unusable: %w", profile.Name, buildErr)
+		return upstreamRoute{}, fmt.Errorf("upstream proxy %q is unusable", profile.Name)
 	}
 
 	p.logger.Debug("routing request through upstream proxy",
@@ -84,73 +79,8 @@ func (p *Proxy) routeFor(ctx context.Context, vaultID, serviceName, host string)
 	return upstreamRoute{transport: transport, tunnel: tunnel, profile: profile}, nil
 }
 
-// failOpenReplayBytes caps how much request body is held in memory purely so a
-// fail_open profile can replay the request directly after a failed proxy hop.
-// Requests above this keep the "honour the proxy or fail" behaviour: a half-
-// sent replay is worse than an honest 502.
-const failOpenReplayBytes = 8 << 20
-
-// roundTrip sends req through route, honouring the profile's failure policy.
-//
-// Only failures tagged as reaching *the proxy itself* are eligible for the
-// fail_open fallback; a target-side error is returned untouched. Without that
-// distinction, any upstream problem (TLS mismatch, DNS failure at the target)
-// would silently convert into a policy bypass — the one thing an operator
-// trusting an egress proxy must never get.
 func (p *Proxy) roundTrip(outReq *http.Request, route upstreamRoute, target string) (*http.Response, error) {
-	if route.profile == nil || route.profile.FailureMode() != brokercore.UpstreamProxyFailOpen {
-		return route.transport.RoundTrip(outReq)
-	}
-
-	replay, replayable := p.replayableBody(outReq)
-	resp, err := route.transport.RoundTrip(outReq)
-	if err == nil || !errors.Is(err, egress.ErrProxyUnreachable) {
-		return resp, err
-	}
-	if !replayable {
-		return resp, err
-	}
-	if replay != nil {
-		outReq.Body = replay()
-	}
-	p.logger.Warn("egress proxy unreachable; dialling directly under fail_open",
-		slog.String("profile", route.profile.Name),
-		slog.String("target", target),
-		slog.String("host", route.profile.Host),
-		slog.String("error", err.Error()))
-	return p.upstream.RoundTrip(outReq)
-}
-
-// replayableBody reports whether outReq's body can be replayed for a second
-// attempt, and returns the factory that produces it. Absent bodies are
-// trivially replayable; large or chunked ones are not.
-func (p *Proxy) replayableBody(outReq *http.Request) (func() io.ReadCloser, bool) {
-	if outReq.Body == nil {
-		return nil, true
-	}
-	if outReq.GetBody != nil {
-		return func() io.ReadCloser {
-			body, err := outReq.GetBody()
-			if err != nil {
-				return nil
-			}
-			return body
-		}, true
-	}
-	if outReq.ContentLength < 0 || outReq.ContentLength > failOpenReplayBytes {
-		p.logger.Debug("request too large to replay; fail_open fallback unavailable",
-			slog.Int64("content_length", outReq.ContentLength))
-		return nil, false
-	}
-	data, err := io.ReadAll(outReq.Body)
-	if err != nil {
-		p.logger.Debug("could not buffer request body for replay",
-			slog.String("error", err.Error()))
-		return nil, false
-	}
-	_ = outReq.Body.Close()
-	outReq.Body = io.NopCloser(bytes.NewReader(data))
-	return func() io.ReadCloser { return io.NopCloser(bytes.NewReader(data)) }, true
+	return egress.RoundTripWithFallback(outReq, route.profile, route.transport, p.upstream, p.logger)
 }
 
 // dial opens the next hop for a hijacked connection (WebSocket upgrades),
@@ -172,7 +102,7 @@ func (p *Proxy) dial(ctx context.Context, addr string, route upstreamRoute, tran
 		return conn, err
 	}
 	if route.profile.FailureMode() != brokercore.UpstreamProxyFailOpen ||
-		!errors.Is(err, egress.ErrProxyUnreachable) {
+		!errors.Is(err, egress.ErrProxyUnreachable) || ctx.Err() != nil {
 		return conn, err
 	}
 

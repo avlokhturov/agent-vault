@@ -1,6 +1,7 @@
 package netguard
 
 import (
+	"context"
 	"net"
 	"testing"
 )
@@ -229,5 +230,28 @@ func TestParseCIDRList(t *testing.T) {
 	}
 	if !got[2].Contains(net.ParseIP("fd00::1")) || got[2].Contains(net.ParseIP("fd00::2")) {
 		t.Error("range[2] should be fd00::1/128, not a wider IPv6 prefix")
+	}
+}
+
+func TestResolveTargetIPsAppliesPolicyToIPLiterals(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("AGENT_VAULT_ALLOW_PRIVATE_RANGES", "false")
+	t.Setenv("AGENT_VAULT_NETWORK_ALLOWLIST", "")
+	if _, err := ResolveTargetIPs(ctx, "169.254.169.254"); err == nil {
+		t.Fatal("metadata IP literal must be rejected")
+	}
+	if _, err := ResolveTargetIPs(ctx, "10.0.0.1"); err == nil {
+		t.Fatal("private IP literal must be rejected by default")
+	}
+	t.Setenv("AGENT_VAULT_ALLOW_PRIVATE_RANGES", "true")
+	ips, err := ResolveTargetIPs(ctx, "10.0.0.1")
+	if err != nil {
+		t.Fatalf("allowed private IP: %v", err)
+	}
+	if len(ips) != 1 || !ips[0].IP.Equal(net.ParseIP("10.0.0.1")) {
+		t.Fatalf("resolved literal IPs = %#v", ips)
+	}
+	if err := ValidateRemoteTargetName(ctx, "169.254.169.254"); err == nil {
+		t.Fatal("remote DNS validation must still reject metadata IP literals")
 	}
 }
