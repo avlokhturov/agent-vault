@@ -253,13 +253,14 @@ func attachInfisicalIfConfigured(srv *server.Server, logger *slog.Logger) {
 	if os.Getenv("INFISICAL_URL") == "" {
 		return
 	}
+	rt := srv.ControlPlaneRoundTripper(nil)
 	type result struct {
 		c   *infisical.Client
 		err error
 	}
 	done := make(chan result, 1)
 	go func() {
-		c, err := infisical.NewClient(context.Background(), logger)
+		c, err := infisical.NewClient(context.Background(), logger, rt)
 		done <- result{c, err}
 	}()
 	select {

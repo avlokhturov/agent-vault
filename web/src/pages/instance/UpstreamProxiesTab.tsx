@@ -45,9 +45,7 @@ const FAILURE_LABELS: Record<string, string> = {
 const DEFAULT_FAILURE = "fail_closed";
 
 // Profile names are referenced verbatim from a service's `upstream_proxy`
-// field, where broker.ValidateUpstreamProxyName forbids these characters.
-// Nothing enforces that at profile-creation time, so a name that cannot be
-// referenced would only fail later, at the point of use.
+// field, so enforce the broker's validation rules before submitting.
 const FORBIDDEN_NAME_CHARS = " \t\r\n\"'\\/@#:,";
 
 function endpoint(proxy: UpstreamProxy): string {
@@ -157,15 +155,9 @@ export default function UpstreamProxiesTab() {
       header: "Credentials",
       render: (p) =>
         p.has_auth ? (
-          <span className="text-sm text-text-muted">
-            {p.username ? (
-              <span className="font-mono">{p.username}</span>
-            ) : (
-              "Set (no username)"
-            )}
-          </span>
+          <span className="text-sm text-text-muted">Set</span>
         ) : (
-          <span className="text-sm text-text-dim">&mdash;</span>
+          <span className="text-sm text-text-dim">Not set</span>
         ),
     },
     {
@@ -216,8 +208,8 @@ export default function UpstreamProxiesTab() {
             Upstream Proxies
           </h2>
           <p className="text-sm text-text-muted">
-            Instance-level egress proxies for requests leaving this broker. Services select one
-            by name; the default applies to services that do not.
+            Instance-level egress profiles. New services dial directly unless
+            explicitly configured to use the instance default or a named profile.
           </p>
         </div>
         {rows.length > 0 && (
@@ -273,7 +265,6 @@ export default function UpstreamProxiesTab() {
       {editing !== null && (
         <ProxyFormModal
           initial={editing === "" ? undefined : rows.find((p) => p.name === editing)}
-          isFirst={rows.length === 0}
           onClose={() => setEditing(null)}
           onSaved={async () => {
             setEditing(null);
@@ -290,7 +281,7 @@ export default function UpstreamProxiesTab() {
           title="Delete upstream proxy"
           description={
             deleting.is_default
-              ? `Delete the default proxy "${deleting.name}"? Services without an explicit profile will dial their targets directly.`
+              ? `Delete the default proxy "${deleting.name}"? Services opted into it or still inheriting it will dial directly, as will unmatched requests.`
               : `Delete "${deleting.name}"? Services referencing it must be updated before this is allowed.`
           }
           confirmLabel="Delete proxy"
@@ -304,12 +295,10 @@ export default function UpstreamProxiesTab() {
 
 function ProxyFormModal({
   initial,
-  isFirst,
   onClose,
   onSaved,
 }: {
   initial?: UpstreamProxy;
-  isFirst: boolean;
   onClose: () => void;
   onSaved: () => Promise<void>;
 }) {
@@ -318,22 +307,20 @@ function ProxyFormModal({
   const [name, setName] = useState(initial?.name ?? "");
   const [scheme, setScheme] = useState(initial?.scheme ?? "http");
   const [host, setHost] = useState(initial?.host ?? "");
-  const [username, setUsername] = useState(initial?.username ?? "");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [clearAuth, setClearAuth] = useState(false);
   const [noProxy, setNoProxy] = useState(initial?.no_proxy ?? "");
   const [caPem, setCaPem] = useState("");
   const [clearCA, setClearCA] = useState(false);
   const [onFailure, setOnFailure] = useState(initial?.on_failure || DEFAULT_FAILURE);
-  const [isDefault, setIsDefault] = useState(initial?.is_default ?? isFirst);
+  const [isDefault, setIsDefault] = useState(initial?.is_default ?? false);
   const [enabled, setEnabled] = useState(initial?.enabled ?? true);
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
-  // Passwords are write-only server-side, so an untouched edit must send
-  // nothing at all rather than an empty string that would wipe the stored value.
-  const authTouched = password !== "" || username !== (initial?.username ?? "");
+  // Empty edit fields mean "keep"; each nonempty credential is an independent update.
 
   function validate(): string | null {
     if (!isEdit) {
@@ -377,9 +364,9 @@ function ProxyFormModal({
         };
         if (clearAuth) {
           patch.clear_auth = true;
-        } else if (authTouched) {
-          patch.username = username.trim();
-          patch.password = password;
+        } else {
+          if (username.trim()) patch.username = username.trim();
+          if (password) patch.password = password;
         }
         if (clearCA || caPem.trim()) {
           patch.proxy_ca_pem = clearCA ? "" : caPem.trim();
@@ -404,8 +391,8 @@ function ProxyFormModal({
       title={isEdit ? `Edit ${initial.name}` : "Add upstream proxy"}
       description={
         isEdit
-          ? "Names are referenced by services and cannot be changed. Leave the password blank to keep the stored one."
-          : "Services select this profile by name, or inherit it when it is the instance default."
+          ? "Names are referenced by services and cannot be changed. Leave blank to keep the stored value."
+          : "Assign this profile to selected services. Leave Instance default off to keep other traffic direct."
       }
       footer={
         <>
@@ -463,23 +450,28 @@ function ProxyFormModal({
             Credentials (optional)
           </div>
           <div className="space-y-4">
-            <FormField label="Username">
+            <FormField
+              label="Username"
+              helperText={isEdit ? "Leave blank to keep the stored value." : undefined}
+            >
               <Input
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 disabled={clearAuth}
+                placeholder={isEdit ? "Leave blank to keep the stored value" : undefined}
                 autoComplete="off"
               />
             </FormField>
             <FormField
               label={isEdit ? "New password" : "Password"}
-              helperText={isEdit ? "Leave blank to keep the stored password." : undefined}
+              helperText={isEdit ? "Leave blank to keep the stored value." : undefined}
             >
               <Input
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 disabled={clearAuth}
+                placeholder={isEdit ? "Leave blank to keep the stored value" : undefined}
                 autoComplete="new-password"
               />
             </FormField>
@@ -502,18 +494,18 @@ function ProxyFormModal({
         <div className="border-t border-border pt-4 space-y-4">
           <FormField
             label="Bypass list (NO_PROXY)"
-            tooltip="Comma-separated hosts that skip the proxy. Suffix matching applies when an entry starts with a dot; use * to bypass everything."
+            tooltip="Comma-separated hosts (optionally with :port) that skip the proxy. A leading dot matches subdomains; * bypasses everything. URL paths and CIDR ranges are not supported; use the service editor's Direct option for path-specific bypass."
           >
             <Input
               value={noProxy}
               onChange={(e) => setNoProxy(e.target.value)}
-              placeholder="internal.corp.com, .local, 10.0.0.0/8"
+              placeholder="internal.corp.com, .local, api.example.com:443"
             />
           </FormField>
 
           <FormField
             label={hasStoredCA ? "Replace CA certificate (PEM)" : "CA certificate (PEM)"}
-            tooltip="Certificate authority used to verify the proxy itself. Required for HTTPS and socks5h proxies served with a private CA."
+            tooltip="Additional certificate authority for an HTTPS proxy. System roots remain trusted; this does not configure SOCKS TLS or target trust."
             helperText={isEdit && hasStoredCA && !clearCA ? "A certificate is configured. Pasting a new one replaces it." : undefined}
           >
             <textarea
@@ -558,7 +550,7 @@ function ProxyFormModal({
         <div className="border-t border-border pt-4 space-y-4">
           <FormField
             label="Instance default"
-            helperText="Applies to services that do not name a profile. Setting this clears the previous default."
+            helperText="Off by default. On: opted-in services, older services inheriting it, unmatched requests, and server-originated calls use this profile."
           >
             <div className="flex items-center gap-3 pt-1">
               <Toggle checked={isDefault} onChange={setIsDefault} ariaLabel="Instance default" />

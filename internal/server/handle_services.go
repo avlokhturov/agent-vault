@@ -11,6 +11,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/broker"
 	"github.com/Infisical/agent-vault/internal/catalog"
 	"github.com/Infisical/agent-vault/internal/proposal"
+	"github.com/Infisical/agent-vault/internal/store"
 )
 
 // rejectDeprecatedDescription returns the index of the first services
@@ -32,6 +33,15 @@ func rejectDeprecatedDescription(servicesRaw json.RawMessage) int {
 
 const deprecatedDescriptionMsg = "description is no longer supported; rename via the service name field instead"
 
+func writeBrokerConfigError(w http.ResponseWriter, err error, internalMessage string) {
+	var unknown *store.UnknownUpstreamProxyError
+	if errors.As(err, &unknown) {
+		jsonError(w, http.StatusBadRequest, unknown.Error())
+		return
+	}
+	jsonError(w, http.StatusInternalServerError, internalMessage)
+}
+
 // splitInlineHosts copies the input slice and applies SplitInlineHost
 // to each entry so the matcher invariant (Host has no '/') holds before
 // validation. Name is required and validated downstream.
@@ -42,6 +52,57 @@ func splitInlineHosts(in []broker.Service) []broker.Service {
 		out[i] = svc
 	}
 	return out
+}
+
+// serviceEgressFields records whether a caller explicitly set any route field.
+// A bool in broker.Service cannot distinguish false from an omitted field.
+type serviceEgressFields struct {
+	UpstreamProxy       json.RawMessage `json:"upstream_proxy"`
+	UseUpstreamProxy    json.RawMessage `json:"use_upstream_proxy"`
+	BypassUpstreamProxy json.RawMessage `json:"bypass_upstream_proxy"`
+}
+
+// applyServiceEgressChoices preserves an existing route when an update omits
+// its route fields. A new service defaults to direct; an explicit false or
+// empty route field also selects direct, including for older inherited routes.
+// Non-owners may edit other service fields but cannot change an existing
+// route or opt a new service into a proxy. Run under the vault service lock
+// after names have been resolved. Return the name index for the POST upsert.
+func applyServiceEgressChoices(incoming, existing []broker.Service, fields []serviceEgressFields, owner bool) (map[string]int, bool) {
+	byName := make(map[string]int, len(existing))
+	for i, svc := range existing {
+		byName[svc.Name] = i
+	}
+	for i := range incoming {
+		svc := &incoming[i]
+		previousIndex, exists := byName[svc.Name]
+		if svc.UpstreamProxy == "" && !svc.UseUpstreamProxy && !svc.BypassUpstreamProxy {
+			if len(fields[i].UpstreamProxy) != 0 || len(fields[i].UseUpstreamProxy) != 0 || len(fields[i].BypassUpstreamProxy) != 0 {
+				svc.BypassUpstreamProxy = true
+			} else if exists {
+				previous := existing[previousIndex]
+				svc.UpstreamProxy = previous.UpstreamProxy
+				svc.UseUpstreamProxy = previous.UseUpstreamProxy
+				svc.BypassUpstreamProxy = previous.BypassUpstreamProxy
+			} else {
+				svc.BypassUpstreamProxy = true
+			}
+		}
+		if owner {
+			continue
+		}
+		if exists {
+			previous := existing[previousIndex]
+			if svc.UpstreamProxy != previous.UpstreamProxy ||
+				svc.UseUpstreamProxy != previous.UseUpstreamProxy ||
+				svc.BypassUpstreamProxy != previous.BypassUpstreamProxy {
+				return nil, false
+			}
+		} else if svc.UpstreamProxy != "" || svc.UseUpstreamProxy {
+			return nil, false
+		}
+	}
+	return byName, true
 }
 
 // hostAmbiguityError is returned when an unnamed ActionDelete targets a
@@ -365,7 +426,10 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actor, err := s.requireVaultAdmin(w, r, ns.ID)
+	if _, err := s.requireVaultAdmin(w, r, ns.ID); err != nil {
+		return
+	}
+	actor, err := s.requireActor(w, r)
 	if err != nil {
 		return
 	}
@@ -396,6 +460,11 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "At least one service is required")
 		return
 	}
+	var routeFields []serviceEgressFields
+	if err := json.Unmarshal(raw.Services, &routeFields); err != nil {
+		jsonError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
 
 	// The store serializes statements but not the load → validate → save
 	// sequence; without this lock concurrent upserts can both pass the
@@ -423,11 +492,10 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, fmt.Sprintf("Invalid services: %v", err))
 		return
 	}
-
-	// Index existing by canonical Name for upsert.
-	byName := make(map[string]int, len(existing))
-	for i, svc := range existing {
-		byName[svc.Name] = i
+	byName, allowed := applyServiceEgressChoices(incomingSlice, existing, routeFields, actor.IsOwner())
+	if !allowed {
+		jsonError(w, http.StatusForbidden, "Only instance owners can change egress routing")
+		return
 	}
 
 	var upserted []string
@@ -453,9 +521,10 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := s.store.SetBrokerConfig(ctx, ns.ID, string(servicesJSON)); err != nil {
-		jsonError(w, http.StatusInternalServerError, "Failed to set services")
+		writeBrokerConfigError(w, err, "Failed to set services")
 		return
 	}
+	s.invalidateUpstreamProxyCache()
 
 	s.captureEvent(r, "av.service-add", actor, map[string]string{"vault": name})
 	jsonOK(w, map[string]interface{}{
@@ -528,9 +597,10 @@ func (s *Server) handleServiceRemove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := s.store.SetBrokerConfig(ctx, ns.ID, string(servicesJSON)); err != nil {
-		jsonError(w, http.StatusInternalServerError, "Failed to update services")
+		writeBrokerConfigError(w, err, "Failed to update services")
 		return
 	}
+	s.invalidateUpstreamProxyCache()
 
 	s.captureEvent(r, "av.service-remove", actor, map[string]string{"vault": name})
 	jsonOK(w, map[string]interface{}{
@@ -620,9 +690,10 @@ func (s *Server) handleServicePatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := s.store.SetBrokerConfig(ctx, ns.ID, string(servicesJSON)); err != nil {
-		jsonError(w, http.StatusInternalServerError, "Failed to update services")
+		writeBrokerConfigError(w, err, "Failed to update services")
 		return
 	}
+	s.invalidateUpstreamProxyCache()
 
 	jsonOK(w, map[string]interface{}{
 		"vault":   name,
@@ -642,8 +713,12 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Setting services requires admin role.
+	// Setting services requires admin role; egress changes also require owner.
 	if _, err := s.requireVaultAdmin(w, r, ns.ID); err != nil {
+		return
+	}
+	actor, err := s.requireActor(w, r)
+	if err != nil {
 		return
 	}
 
@@ -665,6 +740,11 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, fmt.Sprintf("Invalid services: %v", err))
 		return
 	}
+	var routeFields []serviceEgressFields
+	if err := json.Unmarshal(req.Services, &routeFields); err != nil {
+		jsonError(w, http.StatusBadRequest, fmt.Sprintf("Invalid services: %v", err))
+		return
+	}
 	services = splitInlineHosts(services)
 	cfg := broker.Config{Vault: name, Services: services}
 	if err := broker.Validate(&cfg); err != nil {
@@ -672,6 +752,22 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	unlock, err := s.lockVaultServices(ctx, ns.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "lock failed")
+		return
+	}
+	defer unlock()
+
+	existing, err := s.loadServices(ctx, ns.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "Failed to parse services")
+		return
+	}
+	if _, allowed := applyServiceEgressChoices(services, existing, routeFields, actor.IsOwner()); !allowed {
+		jsonError(w, http.StatusForbidden, "Only instance owners can change egress routing")
+		return
+	}
 	servicesJSON, err := json.Marshal(services)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to marshal services")
@@ -683,17 +779,11 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	unlock, err := s.lockVaultServices(ctx, ns.ID)
-	if err != nil {
-		jsonError(w, http.StatusInternalServerError, "lock failed")
-		return
-	}
-	defer unlock()
-
 	if _, err := s.store.SetBrokerConfig(ctx, ns.ID, string(servicesJSON)); err != nil {
-		jsonError(w, http.StatusInternalServerError, "Failed to set services")
+		writeBrokerConfigError(w, err, "Failed to set services")
 		return
 	}
+	s.invalidateUpstreamProxyCache()
 
 	jsonOK(w, map[string]interface{}{"vault": name, "services_count": len(services)})
 }
@@ -721,9 +811,10 @@ func (s *Server) handleServicesClear(w http.ResponseWriter, r *http.Request) {
 	defer unlock()
 
 	if _, err := s.store.SetBrokerConfig(ctx, ns.ID, "[]"); err != nil {
-		jsonError(w, http.StatusInternalServerError, "Failed to clear services")
+		writeBrokerConfigError(w, err, "Failed to clear services")
 		return
 	}
+	s.invalidateUpstreamProxyCache()
 
 	jsonOK(w, map[string]interface{}{"vault": name, "cleared": true})
 }

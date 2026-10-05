@@ -77,7 +77,7 @@ const slugCacheTTL = time.Hour
 // NewClient returns ErrNotConfigured when INFISICAL_URL is unset (callers
 // keep the server alive) or ErrNoAuthMethod when set but no machine-identity
 // env vars are present.
-func NewClient(ctx context.Context, logger *slog.Logger) (*Client, error) {
+func NewClient(ctx context.Context, logger *slog.Logger, transport http.RoundTripper) (*Client, error) {
 	siteURL := os.Getenv("INFISICAL_URL")
 	if siteURL == "" {
 		return nil, ErrNotConfigured
@@ -94,6 +94,7 @@ func NewClient(ctx context.Context, logger *slog.Logger) (*Client, error) {
 	c := sdk.NewInfisicalClient(ctx, sdk.Config{
 		SiteUrl:          siteURL,
 		AutoTokenRefresh: sdk.BoolPtr(true), // v0.8.0 made this a *bool
+		Transport:        transport,
 
 		CacheExpiryInSeconds: 0, // disable SDK-side secret caching; we own the cache
 	})
@@ -111,7 +112,7 @@ func NewClient(ctx context.Context, logger *slog.Logger) (*Client, error) {
 		method:    method,
 		siteURL:   strings.TrimRight(siteURL, "/"),
 		logger:    logger,
-		httpc:     &http.Client{Timeout: 10 * time.Second},
+		httpc:     &http.Client{Timeout: 10 * time.Second, Transport: transport},
 		slugCache: make(map[string]slugCacheEntry),
 	}, nil
 }
@@ -351,15 +352,4 @@ func loginWithMethod(c sdk.InfisicalClientInterface, method AuthMethod) error {
 	default:
 		return fmt.Errorf("infisical: unsupported auth method %q", method)
 	}
-}
-
-// SetRoundTripper installs a custom transport for the client's direct HTTP
-// calls (project slug lookups and similar control-plane requests). The server
-// uses it to route external secret-store traffic through the instance's
-// outbound proxy. Passing nil restores the standard transport.
-func (c *Client) SetRoundTripper(rt http.RoundTripper) {
-	if c == nil {
-		return
-	}
-	c.httpc = &http.Client{Timeout: 10 * time.Second, Transport: rt}
 }

@@ -26,17 +26,19 @@ import (
 const upstreamProxyCacheTTL = 5 * time.Second
 
 // upstreamProxyResolver resolves the egress proxy for a single brokered
-// request. Precedence is: the profile named by the matched service, then the
-// instance default, then no proxy (direct connection), which is exactly what
-// Agent Vault did before this feature existed.
+// request. A newly created service routes directly unless its operator
+// selects the instance default or names a profile. Older services with no
+// egress selection still inherit the default. Unmatched and control-plane
+// traffic also use the instance default.
 //
 // Nothing here is request-specific beyond the vault and matched service name,
 // so results are cached briefly; see upstreamProxyCacheTTL.
 type upstreamProxyResolver struct {
 	s *Server
 
-	mu    sync.RWMutex
-	cache map[string]cachedUpstreamProxy
+	mu         sync.RWMutex
+	cache      map[string]cachedUpstreamProxy
+	generation uint64
 }
 
 type cachedUpstreamProxy struct {
@@ -61,37 +63,54 @@ func (s *Server) invalidateUpstreamProxyCache() {
 		return
 	}
 	s.upstreamRes.mu.Lock()
+	s.upstreamRes.generation++
 	s.upstreamRes.cache = make(map[string]cachedUpstreamProxy)
 	s.upstreamRes.mu.Unlock()
 }
 
 func (r *upstreamProxyResolver) ResolveUpstreamProxy(ctx context.Context, vaultID, serviceName string) (*brokercore.UpstreamProxy, error) {
 	key := vaultID + "|" + serviceName
-
-	r.mu.RLock()
-	if cached, ok := r.cache[key]; ok && time.Now().Before(cached.expiresAt) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		r.mu.RLock()
+		generation := r.generation
+		if cached, ok := r.cache[key]; ok && time.Now().Before(cached.expiresAt) {
+			r.mu.RUnlock()
+			return cached.proxy, nil
+		}
 		r.mu.RUnlock()
-		return cached.proxy, nil
-	}
-	r.mu.RUnlock()
 
-	proxy, err := r.resolve(ctx, vaultID, serviceName)
-	if err != nil {
-		return nil, err
+		proxy, err := r.resolve(ctx, vaultID, serviceName)
+		r.mu.Lock()
+		if generation != r.generation {
+			r.mu.Unlock()
+			continue
+		}
+		if err == nil && ctx.Err() == nil {
+			r.cache[key] = cachedUpstreamProxy{proxy: proxy, expiresAt: time.Now().Add(upstreamProxyCacheTTL)}
+		}
+		r.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return proxy, nil
 	}
-
-	r.mu.Lock()
-	r.cache[key] = cachedUpstreamProxy{proxy: proxy, expiresAt: time.Now().Add(upstreamProxyCacheTTL)}
-	r.mu.Unlock()
-	return proxy, nil
 }
 
 func (r *upstreamProxyResolver) resolve(ctx context.Context, vaultID, serviceName string) (*brokercore.UpstreamProxy, error) {
-	// 1. Per-service override wins.
+	// 1. A matched service can select direct before any default.
 	if serviceName != "" {
-		name, err := r.serviceProxyName(ctx, vaultID, serviceName)
+		name, bypass, err := r.serviceProxyRoute(ctx, vaultID, serviceName)
 		if err != nil {
 			return nil, err
+		}
+		if bypass {
+			return nil, nil
 		}
 		if name != "" {
 			p, err := r.s.store.GetUpstreamProxyByName(ctx, name)
@@ -115,8 +134,8 @@ func (r *upstreamProxyResolver) resolve(ctx context.Context, vaultID, serviceNam
 		}
 	}
 
-	// 2. Instance-level default covers control-plane traffic and services
-	//    without an explicit override.
+	// 2. Instance-level default covers control-plane and unmatched traffic,
+	//    explicitly opted-in services, and older services with no selection.
 	def, err := r.s.store.GetDefaultUpstreamProxy(ctx)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -127,30 +146,34 @@ func (r *upstreamProxyResolver) resolve(ctx context.Context, vaultID, serviceNam
 	return r.toProfile(ctx, def)
 }
 
-// serviceProxyName finds the egress proxy referenced by a named service. It
-// reads the vault's broker config the same way the service handlers do, so
-// there is exactly one interpretation of "the services for this vault".
-func (r *upstreamProxyResolver) serviceProxyName(ctx context.Context, vaultID, serviceName string) (string, error) {
+// serviceProxyRoute finds the egress choice for a named service. It reads the
+// vault's broker config the same way the service handlers do, so there is
+// exactly one interpretation of "the services for this vault".
+func (r *upstreamProxyResolver) serviceProxyRoute(ctx context.Context, vaultID, serviceName string) (string, bool, error) {
 	bc, err := r.s.store.GetBrokerConfig(ctx, vaultID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", nil
+			return "", false, nil
 		}
-		return "", err
+		return "", false, err
 	}
 	if bc == nil || bc.ServicesJSON == "" {
-		return "", nil
+		return "", false, nil
 	}
 	var services []broker.Service
 	if err := json.Unmarshal([]byte(bc.ServicesJSON), &services); err != nil {
-		return "", err
+		return "", false, err
 	}
 	for _, svc := range services {
-		if svc.Name == serviceName && svc.UpstreamProxy != "" {
-			return svc.UpstreamProxy, nil
+		if svc.Name == serviceName {
+			if (svc.BypassUpstreamProxy && (svc.UpstreamProxy != "" || svc.UseUpstreamProxy)) ||
+				(svc.UseUpstreamProxy && svc.UpstreamProxy != "") {
+				return "", false, errors.New("stored service has conflicting upstream proxy settings")
+			}
+			return svc.UpstreamProxy, svc.BypassUpstreamProxy, nil
 		}
 	}
-	return "", nil
+	return "", false, nil
 }
 
 // toProfile decrypts stored proxy credentials into the runtime profile. The
@@ -206,21 +229,33 @@ type egressRoundTripper struct {
 
 func (t *egressRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	profile, err := t.resolver.ResolveUpstreamProxy(req.Context(), "", "")
-	if err != nil || profile == nil {
+	if err != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, err
+	}
+	if profile == nil {
 		return t.base.RoundTrip(req)
 	}
-	if egress.Bypass(profile.NoProxy, req.URL.Host) {
+	addr, err := egress.TargetAddr(req.URL)
+	if err != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, err
+	}
+	if egress.Bypass(profile.NoProxy, addr) {
 		return t.base.RoundTrip(req)
 	}
 	transport, err := t.registry.Transport(profile)
 	if err != nil {
-		t.logger.Warn("control-plane egress proxy unusable; dialling directly",
-			slog.String("profile", profile.Name),
-			slog.String("host", req.URL.Host),
-			slog.String("error", err.Error()))
-		return t.base.RoundTrip(req)
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, err
 	}
-	return transport.RoundTrip(req)
+	return egress.RoundTripWithFallback(req, profile, transport, t.base, t.logger)
 }
 
 // ControlPlaneRoundTripper wraps base so control-plane HTTP calls honour the
@@ -233,7 +268,7 @@ func (s *Server) ControlPlaneRoundTripper(base *http.Transport) http.RoundTrippe
 	return &egressRoundTripper{
 		base:     base,
 		resolver: s.UpstreamProxyResolver(),
-		registry: s.controlPlaneEgress(),
+		registry: egress.NewRegistry(func() *http.Transport { return base.Clone() }, s.logger, true),
 		logger:   s.logger,
 	}
 }
@@ -252,27 +287,29 @@ func (s *Server) controlPlaneEgress() *egress.Registry {
 	return s.controlPlaneRegistry
 }
 
-// controlPlaneDial returns the SMTP connection factory: SOCKS5 profiles are
-// tunnelled, everything else dials directly. SMTP over an HTTP CONNECT proxy
-// is not supported — email submission through a CONNECT tunnel would need its
-// own CONNECT handshake in this package, and the practical combinations here
-// are direct SMTP or SOCKS5.
-func (s *Server) controlPlaneDial() func(network, addr string) (net.Conn, error) {
-	return func(network, addr string) (net.Conn, error) {
-		profile, err := s.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
-		if err != nil || profile == nil {
-			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(context.Background(), network, addr)
+// controlPlaneDial routes SMTP through the instance default, including HTTP
+// CONNECT and SOCKS tunnels. Only proxy-hop unavailability permits fail-open.
+func (s *Server) controlPlaneDial() func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		direct := func() (net.Conn, error) {
+			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
 		}
-		if profile.Scheme != brokercore.UpstreamProxySchemeSOCKS5 && profile.Scheme != brokercore.UpstreamProxySchemeSOCKS5H {
-			s.logger.Warn("SMTP cannot use an HTTP upstream proxy in this release; dialling directly",
-				slog.String("profile", profile.Name),
-				slog.String("scheme", profile.Scheme))
-			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(context.Background(), network, addr)
+		profile, err := s.UpstreamProxyResolver().ResolveUpstreamProxy(ctx, "", "")
+		if err != nil {
+			return nil, err
+		}
+		if profile == nil || egress.Bypass(profile.NoProxy, addr) {
+			return direct()
 		}
 		tunnel, err := s.controlPlaneEgress().Tunnel(profile)
 		if err != nil {
 			return nil, err
 		}
-		return tunnel(context.Background(), network, addr)
+		conn, err := tunnel(ctx, network, addr)
+		if err != nil && profile.FailureMode() == "fail_open" && errors.Is(err, egress.ErrProxyUnreachable) && ctx.Err() == nil {
+			s.logger.Warn("SMTP egress proxy unreachable; dialling directly", slog.String("profile", profile.Name))
+			return direct()
+		}
+		return conn, err
 	}
 }

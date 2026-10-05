@@ -1,15 +1,20 @@
 package egress
 
 import (
+	"bufio"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -211,8 +216,8 @@ func TestRegistryCachesTransportPerFingerprint(t *testing.T) {
 	if first == different {
 		t.Fatal("a rotated password must yield a fresh transport")
 	}
-	if len(r.transports) != 2 {
-		t.Fatalf("cached transports = %d, want 2", len(r.transports))
+	if len(r.entries) != 1 {
+		t.Fatalf("cached profiles = %d, want one current generation", len(r.entries))
 	}
 }
 
@@ -391,6 +396,33 @@ func TestHTTPSUpstreamViaHTTPSProxyTrustsProfileCA(t *testing.T) {
 	assertUpstreamReached(t, tripped, err)
 }
 
+func TestNoProxyTargetCannotUseProxyCA(t *testing.T) {
+	allowLoopbackTargets(t)
+	var reached atomic.Int32
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	addr := target.Listener.Addr().String()
+	p := testProfile("proxy-ca", brokercore.UpstreamProxySchemeHTTPS, addr)
+	p.NoProxy = addr
+	p.ProxyCAPEM = string(pem.EncodeToMemory(&pem.Block{
+		Type: "CERTIFICATE", Bytes: target.Certificate().Raw,
+	}))
+
+	// This target's certificate is trusted only as the profile's proxy CA.
+	// Even when target and proxy have the same address, the configured proxy
+	// transport must not authenticate a direct target with that CA.
+	if _, err := roundTripGET(t, p, nil, target.URL+"/"); err == nil {
+		t.Fatal("no_proxy target accepted a certificate trusted only by the proxy CA")
+	}
+	if got := reached.Load(); got != 0 {
+		t.Fatalf("untrusted target received %d requests", got)
+	}
+}
+
 func TestUpstreamViaSOCKS5Proxy(t *testing.T) {
 	allowLoopbackTargets(t)
 	upstream := upstreamPlain(t)
@@ -421,6 +453,32 @@ func TestUpstreamViaSOCKS5WithUsernamePassword(t *testing.T) {
 	}
 }
 
+func TestSOCKSSchemesSelectLocalOrRemoteDNS(t *testing.T) {
+	allowLoopbackTargets(t)
+	upstream := upstreamPlain(t)
+	targetURL := strings.Replace(upstream.URL, "127.0.0.1", "localhost", 1)
+	for _, tc := range []struct {
+		scheme string
+		want   byte
+	}{
+		{brokercore.UpstreamProxySchemeSOCKS5, 0},
+		{brokercore.UpstreamProxySchemeSOCKS5H, 3},
+	} {
+		t.Run(tc.scheme, func(t *testing.T) {
+			socks := egresstest.NewSOCKS5Proxy(t, "", "")
+			p := testProfile(tc.scheme, tc.scheme, socks.Addr())
+			result, err := roundTripGET(t, p, nil, targetURL+"/")
+			assertUpstreamReached(t, result, err)
+			got := socks.LastATYP()
+			if tc.scheme == brokercore.UpstreamProxySchemeSOCKS5 && got == 3 {
+				t.Fatal("socks5 sent a domain name instead of a locally resolved IP")
+			}
+			if got != tc.want && tc.want != 0 {
+				t.Fatalf("SOCKS ATYP = %d, want %d (domain)", got, tc.want)
+			}
+		})
+	}
+}
 func TestUpstreamViaSOCKS5RejectsWrongCredentials(t *testing.T) {
 	allowLoopbackTargets(t)
 	upstream := upstreamPlain(t)
@@ -633,5 +691,332 @@ func TestUnreachableProxySurfacesAnError(t *testing.T) {
 	}
 	if got := blackhole.ConnectionCount(); got == 0 {
 		t.Fatal("expected at least one connection attempt to the dead proxy")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func TestRegistryEvictsLeastRecentlyUsedProfileAtBound(t *testing.T) {
+	r := NewRegistry(baseFactory(nil), nil, false)
+	for i := range maxCachedProfiles + 1 {
+		p := testProfile(fmt.Sprintf("p-%d", i), brokercore.UpstreamProxySchemeHTTP, "proxy.internal:3128")
+		if _, err := r.Transport(p); err != nil {
+			t.Fatalf("Transport(%s): %v", p.Name, err)
+		}
+	}
+	if got := len(r.entries); got != maxCachedProfiles {
+		t.Fatalf("cached profile count = %d, want %d", got, maxCachedProfiles)
+	}
+	if _, ok := r.entries["p-0"]; ok {
+		t.Fatal("least-recently-used profile was retained")
+	}
+	if _, ok := r.entries[fmt.Sprintf("p-%d", maxCachedProfiles)]; !ok {
+		t.Fatal("newest profile was evicted")
+	}
+}
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestRoundTripWithFallbackReplaysOnlyBoundedKnownBodies(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		body        string
+		contentSize int64
+		wantReplay  bool
+	}{
+		{name: "exact limit", body: strings.Repeat("x", maxReplayBodyBytes), contentSize: maxReplayBodyBytes, wantReplay: true},
+		{name: "over limit", body: strings.Repeat("x", maxReplayBodyBytes+1), contentSize: maxReplayBodyBytes + 1},
+		{name: "unknown size", body: "chunked", contentSize: -1},
+		{name: "zero declared size", body: "unknown", contentSize: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, "http://example.test/upload", io.NopCloser(strings.NewReader(tc.body)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.ContentLength = tc.contentSize
+			profile := testProfile("fallback", brokercore.UpstreamProxySchemeHTTP, "proxy:8080")
+			profile.OnFailure = brokercore.UpstreamProxyFailOpen
+			viaCalls, directCalls := 0, 0
+			via := roundTripFunc(func(*http.Request) (*http.Response, error) {
+				viaCalls++
+				return nil, ErrProxyUnreachable
+			})
+			direct := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				directCalls++
+				got, readErr := io.ReadAll(req.Body)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if string(got) != tc.body {
+					t.Fatalf("direct body mismatch")
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+			})
+			_, err = RoundTripWithFallback(req, profile, via, direct, nil)
+			if tc.wantReplay && err != nil {
+				t.Fatalf("RoundTripWithFallback: %v", err)
+			}
+			wantDirect := 0
+			if tc.wantReplay {
+				wantDirect = 1
+			}
+			if viaCalls != 1 || directCalls != wantDirect {
+				t.Fatalf("calls via=%d direct=%d; want via=1 direct=%d", viaCalls, directCalls, wantDirect)
+			}
+		})
+	}
+}
+
+func TestTargetAddrDefaultsAndIPv6(t *testing.T) {
+	for raw, want := range map[string]string{
+		"http://localhost/path":  "localhost:80",
+		"https://localhost/path": "localhost:443",
+		"https://[2001:db8::1]/": "[2001:db8::1]:443",
+	} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := TargetAddr(u)
+		if err != nil || got != want {
+			t.Errorf("TargetAddr(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+	}
+}
+
+func TestValidateProxyCAPEMRejectsMalformedNonemptyInput(t *testing.T) {
+	for _, pem := range []string{"not pem", "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----"} {
+		if err := ValidateProxyCAPEM(pem); err == nil {
+			t.Errorf("ValidateProxyCAPEM(%q) = nil, want error", pem)
+		}
+	}
+	if err := ValidateProxyCAPEM(" \n"); err != nil {
+		t.Fatalf("empty PEM: %v", err)
+	}
+}
+
+func TestRegistryRejectsMalformedProxyCAWithoutBuildingTransport(t *testing.T) {
+	factoryCalls := 0
+	r := NewRegistry(func() *http.Transport {
+		factoryCalls++
+		return &http.Transport{}
+	}, nil, true)
+	p := testProfile("bad-ca", brokercore.UpstreamProxySchemeHTTPS, "proxy.internal:443")
+	p.ProxyCAPEM = "invalid PEM"
+	if _, err := r.Transport(p); err == nil {
+		t.Fatal("invalid non-empty proxy CA must reject the profile")
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("transport factory calls = %d, want 0", factoryCalls)
+	}
+}
+
+func TestRoundTripWithFallbackRejectsUnreadableOrMismatchedBodyBeforeNetwork(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body io.Reader
+	}{
+		{name: "reader error", body: failingReader{}},
+		{name: "declared length mismatch", body: strings.NewReader("short")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, "http://example.test/upload", io.NopCloser(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.ContentLength = 8
+			profile := testProfile("fallback", brokercore.UpstreamProxySchemeHTTP, "proxy:8080")
+			profile.OnFailure = brokercore.UpstreamProxyFailOpen
+			networkCalls := 0
+			rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+				networkCalls++
+				return nil, nil
+			})
+			if _, err := RoundTripWithFallback(req, profile, rt, rt, nil); err == nil {
+				t.Fatal("invalid body must fail before network")
+			}
+			if networkCalls != 0 {
+				t.Fatalf("round trips = %d, want 0", networkCalls)
+			}
+		})
+	}
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, fmt.Errorf("reader failed") }
+
+func TestRoundTripWithFallbackStopsWhenGetBodyFails(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "http://example.test/upload", io.NopCloser(strings.NewReader("x")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = 1
+	req.GetBody = func() (io.ReadCloser, error) { return nil, fmt.Errorf("replay unavailable") }
+	profile := testProfile("fallback", brokercore.UpstreamProxySchemeHTTP, "proxy:8080")
+	profile.OnFailure = brokercore.UpstreamProxyFailOpen
+	directCalls := 0
+	via := roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, ErrProxyUnreachable })
+	direct := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		directCalls++
+		return nil, nil
+	})
+	if _, err := RoundTripWithFallback(req, profile, via, direct, nil); err == nil {
+		t.Fatal("GetBody error must terminate fallback")
+	}
+	if directCalls != 0 {
+		t.Fatalf("direct round trips = %d, want 0", directCalls)
+	}
+}
+func TestConnectTunnelPreservesBytesAfterHeaders(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	go func() {
+		reader := bufio.NewReader(server)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil || line == "\r\n" {
+				break
+			}
+		}
+		_, _ = io.WriteString(server, "HTTP/1.1 200 Connection established\r\n\r\nSMTP greeting")
+	}()
+	tunneled, err := connectTunnel(context.Background(), client, "smtp.example:25", testProfile("p", brokercore.UpstreamProxySchemeHTTP, "proxy:8080"))
+	if err != nil {
+		t.Fatalf("connectTunnel: %v", err)
+	}
+	defer tunneled.Close()
+	got := make([]byte, len("SMTP greeting"))
+	if _, err := io.ReadFull(tunneled, got); err != nil {
+		t.Fatalf("reading preserved greeting: %v", err)
+	}
+	if string(got) != "SMTP greeting" {
+		t.Fatalf("greeting = %q", got)
+	}
+}
+
+func TestConnectTunnelCancellationUnblocksHandshake(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		conn, err := connectTunnel(ctx, client, "smtp.example:25", testProfile("p", brokercore.UpstreamProxySchemeHTTP, "proxy:8080"))
+		done <- result{conn: conn, err: err}
+	}()
+	requestRead := make(chan struct{})
+	go func() {
+		reader := bufio.NewReader(server)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil || line == "\r\n" {
+				break
+			}
+		}
+		close(requestRead)
+	}()
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("CONNECT request was not written")
+	}
+	cancel()
+	select {
+	case got := <-done:
+		if got.conn != nil || got.err != context.Canceled {
+			t.Fatalf("connectTunnel result = (%v, %v), want cancellation", got.conn, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CONNECT handshake did not unblock promptly after cancellation")
+	}
+}
+
+func TestSOCKSDialCancellationClosesProxySocket(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	requestRead := make(chan struct{})
+	proxyClosed := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		greeting := make([]byte, 3)
+		if _, err := io.ReadFull(conn, greeting); err != nil {
+			close(proxyClosed)
+			return
+		}
+		_, _ = conn.Write([]byte{5, 0})
+		head := make([]byte, 4)
+		if _, err := io.ReadFull(conn, head); err != nil {
+			close(proxyClosed)
+			return
+		}
+		var addrLen int
+		switch head[3] {
+		case 1:
+			addrLen = 4
+		case 4:
+			addrLen = 16
+		case 3:
+			length := []byte{0}
+			if _, err := io.ReadFull(conn, length); err != nil {
+				close(proxyClosed)
+				return
+			}
+			addrLen = int(length[0])
+		}
+		if _, err := io.CopyN(io.Discard, conn, int64(addrLen+2)); err != nil {
+			close(proxyClosed)
+			return
+		}
+		close(requestRead)
+		one := make([]byte, 1)
+		_, _ = conn.Read(one)
+		close(proxyClosed)
+	}()
+
+	registry := NewRegistry(baseFactory(nil), nil, false)
+	tunnel, err := registry.Tunnel(testProfile("stalled", brokercore.UpstreamProxySchemeSOCKS5, listener.Addr().String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		conn, dialErr := tunnel(ctx, "tcp", "127.0.0.1:80")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		done <- dialErr
+	}()
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("SOCKS proxy did not receive request")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("SOCKS dial succeeded despite pending proxy reply")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SOCKS dial did not return promptly after cancellation")
+	}
+	select {
+	case <-proxyClosed:
+	case <-time.After(time.Second):
+		t.Fatal("proxy socket remained open after cancellation")
 	}
 }

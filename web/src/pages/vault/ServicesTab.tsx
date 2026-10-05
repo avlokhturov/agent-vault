@@ -31,10 +31,11 @@ interface Service {
   enabled?: boolean;
   auth: Auth;
   substitutions?: Substitution[];
-  // Name of an instance-level egress proxy profile. Empty/absent means
-  // "instance default, else dial the target directly". Set only by operators;
-  // proposals preserve whatever is stored.
+  // Named profile or explicit opt-in to the instance default. Existing
+  // direct and legacy inherited routes retain their stored selection.
   upstream_proxy?: string;
+  use_upstream_proxy?: boolean;
+  bypass_upstream_proxy?: boolean;
 }
 
 type SubstitutionSurface = (typeof SUBSTITUTION_SURFACES)[number];
@@ -447,6 +448,7 @@ export default function ServicesTab() {
           catalog={catalog}
           upstreamProxyNames={upstreamProxyNames}
           canSelectUpstreamProxy={isOwner}
+          canRenameName={isOwner}
           onClose={() => {
             setEditingIndex(null);
             setAddWithHost(null);
@@ -481,6 +483,7 @@ function ServiceModal({
   catalog,
   upstreamProxyNames,
   canSelectUpstreamProxy,
+  canRenameName,
   onClose,
   onSave,
 }: {
@@ -494,14 +497,18 @@ function ServiceModal({
   catalog: CatalogTemplate[];
   upstreamProxyNames: string[];
   canSelectUpstreamProxy: boolean;
+  canRenameName: boolean;
   onClose: () => void;
   onSave: (service: Service) => Promise<void>;
 }) {
   const [name, setName] = useState(initial?.name ?? defaultName ?? "");
+  const canEditName = !initial || canRenameName;
   const [pattern, setPattern] = useState(initial?.host ?? defaultHost ?? "");
   const [enabled, setEnabled] = useState(initial ? initial.enabled !== false : true);
   const [authType, setAuthType] = useState<AuthType>((initial?.auth?.type as AuthType) ?? (defaultAuthScheme as AuthType) ?? "passthrough");
-  const [upstreamProxy, setUpstreamProxy] = useState(initial?.upstream_proxy ?? "");
+  const [upstreamProxy, setUpstreamProxy] = useState(
+    initial?.upstream_proxy ? initial.upstream_proxy : initial && !initial.bypass_upstream_proxy ? ":default" : ""
+  );
 
   // Bearer fields
   const [token, setToken] = useState(initial?.auth?.token ?? "");
@@ -659,11 +666,10 @@ function ServiceModal({
     }
   }
 
-  // A referenced profile stays selectable even when it is absent from the
-  // caller's list, so an editor who cannot list profiles (a non-owner) still
-  // round-trips the existing value instead of clearing it.
+  // Show the existing profile to non-owners, but omit all route fields from
+  // their writes so the server preserves even legacy inherited selections.
   const proxyOptions =
-    upstreamProxy && !upstreamProxyNames.includes(upstreamProxy)
+    upstreamProxy && upstreamProxy !== ":default" && !upstreamProxyNames.includes(upstreamProxy)
       ? [upstreamProxy, ...upstreamProxyNames]
       : upstreamProxyNames;
 
@@ -684,12 +690,18 @@ function ServiceModal({
       // Send only `host` (inline-form accepted). Server splits into
       // host + path on ingest — the UI never names a separate path field.
       const service: Service = {
-        name: name.trim(),
+        name: initial && !canRenameName ? initial.name : name.trim(),
         host: pattern.trim(),
         ...(enabled ? {} : { enabled: false }),
         auth: buildAuth(),
         ...(cleanedSubs.length > 0 && { substitutions: cleanedSubs }),
-        ...(upstreamProxy && { upstream_proxy: upstreamProxy }),
+        ...(canSelectUpstreamProxy
+          ? upstreamProxy === ":default"
+            ? { use_upstream_proxy: true }
+            : upstreamProxy
+              ? { upstream_proxy: upstreamProxy }
+              : { bypass_upstream_proxy: true }
+          : {}),
       };
       await onSave(service);
     } catch (err: unknown) {
@@ -735,12 +747,18 @@ function ServiceModal({
             label="Name"
             tooltip="Slug-style identifier (3–64 chars, lowercase, hyphens). The canonical per-vault key for this service."
             required
+            helperText={
+              initial && !canRenameName
+                ? "Only instance owners can rename here. Admins may still remove and add services."
+                : undefined
+            }
           >
             <Input
               placeholder="e.g. stripe, slack-bot, internal-billing"
               value={name}
               onChange={(e) => setName(e.target.value)}
               autoFocus
+              disabled={!canEditName}
             />
           </FormField>
           <FormField
@@ -764,14 +782,14 @@ function ServiceModal({
             <Toggle checked={enabled} onChange={setEnabled} ariaLabel="Enabled" />
           </div>
 
-          {(upstreamProxy || proxyOptions.length > 0) && (
+          {(canSelectUpstreamProxy || initial) && (
             <FormField
               label="Upstream Proxy"
-              tooltip="Routes this service's outbound requests through the named egress profile instead of dialing the target directly. Instance default applies when unset."
+              tooltip="New services dial directly unless you opt into the instance default or select a named profile."
               helperText={
                 canSelectUpstreamProxy
-                  ? undefined
-                  : "Only instance owners can change egress routing. The current profile is preserved on save."
+                  ? "This choice affects only requests matching this service. Unmatched and broker control-plane traffic still use the instance default."
+                  : "Only instance owners can change egress routing. The current selection is preserved on save."
               }
             >
               <Select
@@ -779,7 +797,8 @@ function ServiceModal({
                 onChange={(e) => setUpstreamProxy(e.target.value)}
                 disabled={!canSelectUpstreamProxy}
               >
-                <option value="">Instance default</option>
+                <option value="">Direct (default for new services)</option>
+                <option value=":default">Use instance default proxy</option>
                 {proxyOptions.map((proxyName) => (
                   <option key={proxyName} value={proxyName}>
                     {proxyName}

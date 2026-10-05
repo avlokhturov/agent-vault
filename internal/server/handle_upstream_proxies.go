@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
+	"github.com/Infisical/agent-vault/internal/broker"
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/egress"
@@ -16,10 +19,9 @@ import (
 
 // --- Admin API: instance-level upstream (egress) proxy profiles ---
 //
-// Profiles are created here, referenced by name from service rules, and
-// resolved per request by upstreamProxyResolver. Proxy passwords are accepted
-// in plaintext over the wire (same as credentials), encrypted immediately with
-// the data encryption key, and never returned by any read endpoint.
+// Profiles are referenced by name from service rules and resolved per request
+// by upstreamProxyResolver. Credentials are encrypted immediately on write and
+// never returned by any read endpoint.
 
 type createUpstreamProxyRequest struct {
 	Name       string `json:"name"`
@@ -54,7 +56,6 @@ type proxyView struct {
 	Scheme    string `json:"scheme"`
 	Host      string `json:"host"`
 	HasAuth   bool   `json:"has_auth"`
-	Username  string `json:"username,omitempty"`
 	NoProxy   string `json:"no_proxy"`
 	HasCA     bool   `json:"has_ca"`
 	OnFailure string `json:"on_failure"`
@@ -69,8 +70,7 @@ func (s *Server) viewProxy(p *store.UpstreamProxy) proxyView {
 		Name:      p.Name,
 		Scheme:    p.Scheme,
 		Host:      p.Host,
-		HasAuth:   len(p.PasswordCT) > 0 || len(p.UsernameCT) > 0,
-		Username:  s.decryptToString(p.UsernameCT, p.UsernameNonce),
+		HasAuth:   s.proxyHasAuth(p),
 		NoProxy:   p.NoProxy,
 		HasCA:     strings.TrimSpace(p.ProxyCAPEM) != "",
 		OnFailure: p.OnFailure,
@@ -81,20 +81,26 @@ func (s *Server) viewProxy(p *store.UpstreamProxy) proxyView {
 	}
 }
 
-// decryptToString reverses credential encryption for operator-facing reads.
-// Only ever called for usernames: passwords are deliberately one-way from the
-// API's point of view and are never decrypted back out of the database.
-func (s *Server) decryptToString(ct, nonce []byte) string {
-	if len(ct) == 0 {
-		return ""
+func (s *Server) proxyHasAuth(p *store.UpstreamProxy) bool {
+	if len(p.UsernameCT) > 0 {
+		username, err := crypto.Decrypt(p.UsernameCT, p.UsernameNonce, s.encKey)
+		if err == nil {
+			hasAuth := len(username) > 0
+			crypto.WipeBytes(username)
+			if hasAuth {
+				return true
+			}
+		}
 	}
-	pt, err := crypto.Decrypt(ct, nonce, s.encKey)
-	if err != nil {
-		return ""
+	if len(p.PasswordCT) > 0 {
+		password, err := crypto.Decrypt(p.PasswordCT, p.PasswordNonce, s.encKey)
+		if err == nil {
+			hasAuth := len(password) > 0
+			crypto.WipeBytes(password)
+			return hasAuth
+		}
 	}
-	out := string(pt)
-	crypto.WipeBytes(pt)
-	return out
+	return false
 }
 
 func (s *Server) handleListUpstreamProxies(w http.ResponseWriter, r *http.Request) {
@@ -128,10 +134,11 @@ func (s *Server) handleCreateUpstreamProxy(w http.ResponseWriter, r *http.Reques
 		jsonError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	if len(req.Name) > 64 {
-		jsonError(w, http.StatusBadRequest, "name must be at most 64 characters")
+	if err := broker.ValidateUpstreamProxyName(req.Name); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	req.Scheme = strings.ToLower(strings.TrimSpace(req.Scheme))
 	if !brokercore.IsValidUpstreamProxyScheme(req.Scheme) {
 		jsonError(w, http.StatusBadRequest, "scheme must be one of: http, https, socks5, socks5h")
 		return
@@ -140,7 +147,11 @@ func (s *Server) handleCreateUpstreamProxy(w http.ResponseWriter, r *http.Reques
 		jsonError(w, http.StatusBadRequest, "on_failure must be one of: fail_closed, fail_open")
 		return
 	}
-	if err := egress.ValidateHost(req.Host); err != nil {
+	if err := validateProxyEndpoint(req.Host); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := egress.ValidateProxyCAPEM(req.ProxyCAPEM); err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -158,18 +169,20 @@ func (s *Server) handleCreateUpstreamProxy(w http.ResponseWriter, r *http.Reques
 	if req.Enabled != nil {
 		p.Enabled = *req.Enabled
 	}
-	if req.Username != "" || req.Password != "" {
-		ct, nonce, err := crypto.Encrypt([]byte(req.Password), s.encKey)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "Encryption failed")
-			return
-		}
+	if req.Username != "" {
 		uct, unonce, err := crypto.Encrypt([]byte(req.Username), s.encKey)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, "Encryption failed")
 			return
 		}
 		p.UsernameCT, p.UsernameNonce = uct, unonce
+	}
+	if req.Password != "" {
+		ct, nonce, err := crypto.Encrypt([]byte(req.Password), s.encKey)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "Encryption failed")
+			return
+		}
 		p.PasswordCT, p.PasswordNonce = ct, nonce
 	}
 
@@ -213,8 +226,7 @@ func (s *Server) handleUpdateUpstreamProxy(w http.ResponseWriter, r *http.Reques
 	}
 
 	name := r.PathValue("name")
-	existing, err := s.store.GetUpstreamProxyByName(r.Context(), name)
-	if err != nil {
+	if _, err := s.store.GetUpstreamProxyByName(r.Context(), name); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			jsonError(w, http.StatusNotFound, "Upstream proxy not found")
 			return
@@ -231,14 +243,15 @@ func (s *Server) handleUpdateUpstreamProxy(w http.ResponseWriter, r *http.Reques
 
 	params := store.UpdateUpstreamProxyParams{Name: name}
 	if req.Scheme != nil {
-		if !brokercore.IsValidUpstreamProxyScheme(*req.Scheme) {
+		scheme := strings.ToLower(strings.TrimSpace(*req.Scheme))
+		if !brokercore.IsValidUpstreamProxyScheme(scheme) {
 			jsonError(w, http.StatusBadRequest, "scheme must be one of: http, https, socks5, socks5h")
 			return
 		}
-		params.Scheme = req.Scheme
+		params.Scheme = &scheme
 	}
 	if req.Host != nil {
-		if err := egress.ValidateHost(*req.Host); err != nil {
+		if err := validateProxyEndpoint(*req.Host); err != nil {
 			jsonError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -248,6 +261,10 @@ func (s *Server) handleUpdateUpstreamProxy(w http.ResponseWriter, r *http.Reques
 		params.NoProxy = req.NoProxy
 	}
 	if req.ProxyCAPEM != nil {
+		if err := egress.ValidateProxyCAPEM(*req.ProxyCAPEM); err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		params.ProxyCAPEM = req.ProxyCAPEM
 	}
 	if req.OnFailure != nil {
@@ -267,29 +284,34 @@ func (s *Server) handleUpdateUpstreamProxy(w http.ResponseWriter, r *http.Reques
 		var nilBytes []byte
 		params.UsernameCT, params.UsernameNonce = &nilBytes, &nilBytes
 		params.PasswordCT, params.PasswordNonce = &nilBytes, &nilBytes
-	} else if req.Password != nil || req.Username != nil {
-		user := s.decryptToString(existing.UsernameCT, existing.UsernameNonce)
+	} else {
 		if req.Username != nil {
-			user = *req.Username
+			if *req.Username == "" {
+				var nilBytes []byte
+				params.UsernameCT, params.UsernameNonce = &nilBytes, &nilBytes
+			} else {
+				uct, unonce, err := crypto.Encrypt([]byte(*req.Username), s.encKey)
+				if err != nil {
+					jsonError(w, http.StatusInternalServerError, "Encryption failed")
+					return
+				}
+				params.UsernameCT, params.UsernameNonce = &uct, &unonce
+			}
 		}
-		pass := ""
 		if req.Password != nil {
-			pass = *req.Password
+			if *req.Password == "" {
+				var nilBytes []byte
+				params.PasswordCT, params.PasswordNonce = &nilBytes, &nilBytes
+			} else {
+				ct, nonce, err := crypto.Encrypt([]byte(*req.Password), s.encKey)
+				if err != nil {
+					jsonError(w, http.StatusInternalServerError, "Encryption failed")
+					return
+				}
+				params.PasswordCT, params.PasswordNonce = &ct, &nonce
+			}
 		}
-		uct, unonce, err := crypto.Encrypt([]byte(user), s.encKey)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "Encryption failed")
-			return
-		}
-		ct, nonce, err := crypto.Encrypt([]byte(pass), s.encKey)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "Encryption failed")
-			return
-		}
-		params.UsernameCT, params.UsernameNonce = &uct, &unonce
-		params.PasswordCT, params.PasswordNonce = &ct, &nonce
 	}
-
 	updated, err := s.store.UpdateUpstreamProxy(r.Context(), params)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -303,6 +325,18 @@ func (s *Server) handleUpdateUpstreamProxy(w http.ResponseWriter, r *http.Reques
 	jsonOK(w, map[string]interface{}{"proxy": s.viewProxy(updated)})
 }
 
+func validateProxyEndpoint(host string) error {
+	if err := egress.ValidateHost(host); err != nil {
+		return err
+	}
+	_, port, _ := net.SplitHostPort(host)
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("egress: upstream proxy port must be between 1 and 65535")
+	}
+	return nil
+}
+
 func (s *Server) handleDeleteUpstreamProxy(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.requireOwnerActor(w, r); err != nil {
 		return
@@ -311,28 +345,17 @@ func (s *Server) handleDeleteUpstreamProxy(w http.ResponseWriter, r *http.Reques
 	name := r.PathValue("name")
 	ctx := r.Context()
 
-	if _, err := s.store.GetUpstreamProxyByName(ctx, name); err != nil {
+	if err := s.store.DeleteUpstreamProxy(ctx, name); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			jsonError(w, http.StatusNotFound, "Upstream proxy not found")
 			return
 		}
-		jsonError(w, http.StatusInternalServerError, "Failed to load upstream proxy")
-		return
-	}
-
-	// Refuse deletions that would silently re-route live traffic.
-	refs, err := s.store.CountUpstreamProxyReferences(ctx, name)
-	if err != nil {
-		jsonError(w, http.StatusInternalServerError, "Failed to check upstream proxy references")
-		return
-	}
-	if len(refs) > 0 {
-		jsonError(w, http.StatusConflict,
-			fmt.Sprintf("Upstream proxy %q is referenced by %d service(s): %s", name, len(refs), strings.Join(refs, ", ")))
-		return
-	}
-
-	if err := s.store.DeleteUpstreamProxy(ctx, name); err != nil {
+		var referenced *store.UpstreamProxyReferencedError
+		if errors.As(err, &referenced) {
+			jsonError(w, http.StatusConflict,
+				fmt.Sprintf("Upstream proxy %q is referenced by %d service(s): %s", referenced.Name, len(referenced.References), strings.Join(referenced.References, ", ")))
+			return
+		}
 		jsonError(w, http.StatusInternalServerError, "Failed to delete upstream proxy")
 		return
 	}

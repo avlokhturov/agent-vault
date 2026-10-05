@@ -55,7 +55,6 @@ export type UpstreamProxy = {
   scheme: string;
   host: string;
   has_auth: boolean;
-  username?: string;
   no_proxy: string;
   has_ca: boolean;
   on_failure: string;
@@ -78,10 +77,9 @@ export type UpstreamProxyInput = {
   enabled?: boolean;
 };
 
-// Every field is optional on update, and each one that is present is applied
-// even when it is an empty string (clearing no_proxy, say). `clear_auth` is the
-// explicit "drop stored credentials" switch — sending an empty password would
-// otherwise be indistinguishable from "leave it alone".
+// Every field is optional on update. Username and password are independent:
+// omit one to retain it, or send an empty string to clear only that field.
+// `clear_auth` explicitly drops both credentials.
 export type UpstreamProxyPatch = {
   scheme?: string;
   host?: string;

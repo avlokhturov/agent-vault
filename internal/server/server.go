@@ -116,11 +116,6 @@ func (s *Server) AttachMITM(p *mitm.Proxy) { s.mitm = p }
 // AttachInfisical registers the Infisical client. Must be called before Start.
 func (s *Server) AttachInfisical(c *infisical.Client) {
 	s.infisicalClient = c
-	if c != nil {
-		// External secret-store traffic belongs to the same egress policy as
-		// the rest of the instance's outbound calls.
-		c.SetRoundTripper(s.ControlPlaneRoundTripper(nil))
-	}
 }
 
 // AttachInfisicalSyncer pre-wires a syncer instead of letting Start build one
@@ -818,8 +813,7 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 	oauthTransport.DialContext = netguard.SafeDialContext(netguard.AllowPrivateFromEnv())
 	oauth.TokenClient = &http.Client{Timeout: 30 * time.Second, Transport: s.ControlPlaneRoundTripper(oauthTransport)}
 
-	// SMTP notifications leave through the same egress policy when the
-	// instance default is a SOCKS5 proxy.
+	// SMTP notifications use the same instance-default egress policy.
 	notifier.SetDialer(s.controlPlaneDial())
 
 	ipAuth := s.tier(ratelimit.TierAuth, s.ipKeyer())

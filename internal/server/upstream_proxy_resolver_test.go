@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,9 +20,8 @@ import (
 	"github.com/Infisical/agent-vault/internal/store"
 )
 
-// Resolution precedence decides which proxy carries a request, and it has to
-// fail safe: an operator edit or a deleted profile must degrade to a direct
-// connection rather than becoming an outage or a silent re-route.
+// Resolution precedence decides which proxy carries a request. A missing or
+// disabled named profile falls back to the default; lookup errors fail closed.
 
 func seedProxy(t *testing.T, ms *mockStore, name, scheme, host string, isDefault, enabled bool) *store.UpstreamProxy {
 	t.Helper()
@@ -98,6 +99,30 @@ func TestResolverPrefersServiceProfileOverInstanceDefault(t *testing.T) {
 	}
 }
 
+func TestResolverHonoursServiceDirectBypassWithInstanceDefault(t *testing.T) {
+	ms := newMockStore()
+	seedProxy(t, ms, "default-corp", "http", "default.proxy:3128", true, true)
+	seedProxy(t, ms, "scoped-corp", "socks5", "scoped.proxy:1080", false, true)
+	setServices(t, ms, "root-ns-id", []broker.Service{
+		{Name: "direct", Host: "direct.example.com", BypassUpstreamProxy: true},
+		{Name: "named", Host: "named.example.com", UpstreamProxy: "scoped-corp"},
+	})
+
+	res := newTestServer(withStore(ms)).UpstreamProxyResolver()
+	got, err := res.ResolveUpstreamProxy(context.Background(), "root-ns-id", "direct")
+	if err != nil || got != nil {
+		t.Fatalf("direct service resolved profile %#v, err %v; want nil without error", got, err)
+	}
+	got, err = res.ResolveUpstreamProxy(context.Background(), "root-ns-id", "named")
+	if err != nil || got == nil || got.Name != "scoped-corp" {
+		t.Fatalf("named service resolved %#v, err %v; want named profile", got, err)
+	}
+	got, err = res.ResolveUpstreamProxy(context.Background(), "root-ns-id", "absent")
+	if err != nil || got == nil || got.Name != "default-corp" {
+		t.Fatalf("absent service resolved %#v, err %v; want instance default", got, err)
+	}
+}
+
 func TestResolverReturnsNilWithoutAnyProfile(t *testing.T) {
 	ms := newMockStore()
 	srv := newTestServer(withStore(ms))
@@ -111,12 +136,36 @@ func TestResolverReturnsNilWithoutAnyProfile(t *testing.T) {
 	}
 }
 
+func TestResolverRejectsConflictingStoredServiceRoute(t *testing.T) {
+	ms := newMockStore()
+	seedProxy(t, ms, "default-corp", "http", "default.proxy:3128", true, true)
+	raw, err := marshalServices([]broker.Service{{
+		Name: "anthropic", Host: "api.anthropic.com",
+		UpstreamProxy: "default-corp", BypassUpstreamProxy: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Direct store/import writes can bypass the service API's validation.
+	ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{VaultID: "root-ns-id", ServicesJSON: raw}
+	got, err := newTestServer(withStore(ms)).UpstreamProxyResolver().ResolveUpstreamProxy(t.Context(), "root-ns-id", "anthropic")
+	if err == nil || got != nil {
+		t.Fatalf("conflicting stored route resolved %#v, err %v; want closed failure", got, err)
+	}
+}
+
 func TestResolverFallsBackWhenReferencedProfileIsMissing(t *testing.T) {
 	ms := newMockStore()
 	seedProxy(t, ms, "default-corp", "http", "default.proxy:3128", true, true)
-	setServices(t, ms, "root-ns-id", []broker.Service{
+	// Simulate a pre-existing dangling reference; new writes reject this
+	// state before persistence.
+	raw, err := marshalServices([]broker.Service{
 		{Name: "anthropic", Host: "api.anthropic.com", UpstreamProxy: "deleted-profile"},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{VaultID: "root-ns-id", ServicesJSON: raw}
 
 	srv := newTestServer(withStore(ms))
 	got, err := srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "root-ns-id", "anthropic")
@@ -197,8 +246,7 @@ func TestResolverPropagatesStoreErrors(t *testing.T) {
 	}
 }
 
-// failingProxyStore makes every profile lookup fail, so the resolver can be
-// observed degrading to "no route" instead of inventing one.
+// failingProxyStore makes every profile lookup fail.
 type failingProxyStore struct {
 	*mockStore
 }
@@ -260,6 +308,134 @@ func TestResolverCacheExpires(t *testing.T) {
 	}
 }
 
+type delayedDefaultProxyStore struct {
+	*mockStore
+	started chan struct{}
+	release chan struct{}
+	first   atomic.Bool
+	old     *store.UpstreamProxy
+}
+
+func (s *delayedDefaultProxyStore) GetDefaultUpstreamProxy(ctx context.Context) (*store.UpstreamProxy, error) {
+	if s.first.CompareAndSwap(false, true) {
+		close(s.started)
+		select {
+		case <-s.release:
+			return s.old, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return s.mockStore.GetDefaultUpstreamProxy(ctx)
+}
+
+func TestResolverInvalidationDuringLookupDoesNotRestoreOldRoute(t *testing.T) {
+	ms := newMockStore()
+	old := *seedProxy(t, ms, "corp", "http", "old.proxy:3128", true, true)
+	blocked := &delayedDefaultProxyStore{
+		mockStore: ms, started: make(chan struct{}), release: make(chan struct{}), old: &old,
+	}
+	srv := newTestServer(withStore(blocked))
+	done := make(chan *brokercore.UpstreamProxy, 1)
+	errs := make(chan error, 1)
+	go func() {
+		proxy, err := srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
+		done <- proxy
+		errs <- err
+	}()
+	<-blocked.started
+	ms.upstreamProxies["corp"].Host = "new.proxy:3128"
+	srv.invalidateUpstreamProxyCache()
+	close(blocked.release)
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+	if got := <-done; got == nil || got.Host != "new.proxy:3128" {
+		t.Fatalf("resolved %+v after invalidation, want new proxy", got)
+	}
+	if got, err := srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", ""); err != nil || got == nil || got.Host != "new.proxy:3128" {
+		t.Fatalf("cached route %+v, err %v; want new proxy", got, err)
+	}
+}
+
+func TestControlPlaneResolverErrorDoesNotReachTarget(t *testing.T) {
+	ms := newMockStore()
+	srv := newTestServer(withStore(&failingProxyStore{mockStore: ms}))
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	req, err := http.NewRequest(http.MethodGet, upstream.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.ControlPlaneRoundTripper(nil).RoundTrip(req); err == nil {
+		t.Fatal("resolver failure must fail closed")
+	}
+	if hits != 0 {
+		t.Fatalf("origin received %d requests after resolver failure", hits)
+	}
+}
+
+func TestControlPlaneSMTPDialUsesHTTPConnect(t *testing.T) {
+	t.Setenv("AGENT_VAULT_ALLOW_PRIVATE_RANGES", "true")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	received := make(chan struct{}, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.WriteString(conn, "220 local smtp ready\r\n")
+		received <- struct{}{}
+	}()
+	proxy := egresstest.NewHTTPProxy(t, "", "")
+	ms := newMockStore()
+	seedProxy(t, ms, "corp", "http", proxy.Addr(), true, true)
+	srv := newTestServer(withStore(ms))
+	conn, err := srv.controlPlaneDial()(context.Background(), "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	line := make([]byte, len("220 local smtp ready\r\n"))
+	if _, err := io.ReadFull(conn, line); err != nil {
+		t.Fatal(err)
+	}
+	if string(line) != "220 local smtp ready\r\n" || proxy.LastConnect() != ln.Addr().String() {
+		t.Fatalf("greeting %q, CONNECT %q; expected SMTP via HTTP proxy", line, proxy.LastConnect())
+	}
+	<-received
+}
+
+func TestControlPlaneSMTPResolverErrorNeverDialsTarget(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	srv := newTestServer(withStore(&failingProxyStore{mockStore: newMockStore()}))
+	if conn, err := srv.controlPlaneDial()(context.Background(), "tcp", ln.Addr().String()); err == nil {
+		_ = conn.Close()
+		t.Fatal("resolver error must refuse SMTP connection")
+	}
+	_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(50 * time.Millisecond))
+	if conn, err := ln.Accept(); err == nil {
+		_ = conn.Close()
+		t.Fatal("SMTP connected directly after resolver error")
+	}
+}
+
 func TestControlPlaneRoundTripperUsesDefaultProfile(t *testing.T) {
 	t.Setenv("AGENT_VAULT_ALLOW_PRIVATE_RANGES", "true")
 
@@ -318,6 +494,69 @@ func TestControlPlaneRoundTripperHonoursNoProxy(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if got := egressProxy.RequestCount(); got != 0 {
 		t.Fatalf("egress proxy saw %d requests for a no_proxy host, want 0", got)
+	}
+}
+
+func TestControlPlaneHTTPWithoutExplicitPortUsesProxy(t *testing.T) {
+	t.Setenv("AGENT_VAULT_ALLOW_PRIVATE_RANGES", "true")
+	var proxyRequests atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyRequests.Add(1)
+		if r.URL.String() != "http://localhost/oauth/token" || r.Host != "localhost" {
+			t.Errorf("proxy request URL=%q Host=%q", r.URL, r.Host)
+		}
+		_, _ = io.WriteString(w, "proxied")
+	}))
+	defer proxy.Close()
+	ms := newMockStore()
+	seedProxy(t, ms, "corp", "http", strings.TrimPrefix(proxy.URL, "http://"), true, true)
+	srv := newTestServer(withStore(ms))
+	req, err := http.NewRequest(http.MethodGet, "http://localhost/oauth/token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := srv.ControlPlaneRoundTripper(nil).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Body.Close()
+	body, err := io.ReadAll(got.Body)
+	if err != nil || string(body) != "proxied" || proxyRequests.Load() != 1 {
+		t.Fatalf("response %q, requests=%d, err=%v; expected proxy-only success", body, proxyRequests.Load(), err)
+	}
+}
+
+func TestControlPlanePortQualifiedNoProxyUsesBaseTransport(t *testing.T) {
+	t.Setenv("AGENT_VAULT_ALLOW_PRIVATE_RANGES", "true")
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "localhost" || r.URL.Path != "/oauth/token" {
+			t.Errorf("origin Host=%q path=%q", r.Host, r.URL.Path)
+		}
+		_, _ = io.WriteString(w, "direct")
+	}))
+	defer origin.Close()
+	proxy := egresstest.NewHTTPProxy(t, "", "")
+	ms := newMockStore()
+	seedProxy(t, ms, "corp", "http", proxy.Addr(), true, true).NoProxy = "localhost:80"
+	base := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr != "localhost:80" {
+			t.Errorf("base transport dialled %q, want localhost:80", addr)
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, strings.TrimPrefix(origin.URL, "http://"))
+	}}
+	srv := newTestServer(withStore(ms))
+	req, err := http.NewRequest(http.MethodGet, "http://localhost/oauth/token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.ControlPlaneRoundTripper(base).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != "direct" || proxy.RequestCount() != 0 {
+		t.Fatalf("response=%q proxy requests=%d err=%v", body, proxy.RequestCount(), err)
 	}
 }
 

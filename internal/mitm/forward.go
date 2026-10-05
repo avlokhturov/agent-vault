@@ -218,7 +218,9 @@ func (p *Proxy) forwardRequest(
 	}
 	defer enf.Release()
 
-	r.Body = http.MaxBytesReader(w, r.Body, p.maxRequestBytes)
+	if r.Body != nil && r.Body != http.NoBody {
+		r.Body = http.MaxBytesReader(w, r.Body, p.maxRequestBytes)
+	}
 
 	scheme := "http"
 	if useTLSUpstream {

@@ -78,17 +78,14 @@ func LoadSMTPConfig() *SMTPConfig {
 // If created with a nil config, all operations are silent no-ops.
 type Notifier struct {
 	config *SMTPConfig
-	// dialer overrides how SMTP connections are established. Set by the
-	// server when an egress proxy carries instance-level outbound traffic;
-	// nil preserves the plain net.Dial behaviour this package has always
-	// used. It is consulted per send so a newly-configured proxy takes
-	// effect without a restart.
-	dialer func(network, addr string) (net.Conn, error)
+	// dialer overrides SMTP connections; the supplied context bounds the
+	// entire proxy handshake, not just the TCP connection to the proxy.
+	dialer func(context.Context, string, string) (net.Conn, error)
 }
 
 // SetDialer installs an optional connection factory used for every SMTP
 // dial (both STARTTLS and implicit TLS).
-func (n *Notifier) SetDialer(d func(network, addr string) (net.Conn, error)) {
+func (n *Notifier) SetDialer(d func(context.Context, string, string) (net.Conn, error)) {
 	if n == nil {
 		return
 	}
@@ -98,32 +95,12 @@ func (n *Notifier) SetDialer(d func(network, addr string) (net.Conn, error)) {
 // dialTCP opens the SMTP connection, routing through the configured egress
 // dialer when one is installed.
 func (n *Notifier) dialTCP(addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	if n != nil && n.dialer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		type result struct {
-			conn net.Conn
-			err  error
-		}
-		done := make(chan result, 1)
-		go func() {
-			conn, err := n.dialer("tcp", addr)
-			done <- result{conn: conn, err: err}
-		}()
-		select {
-		case res := <-done:
-			return res.conn, res.err
-		case <-ctx.Done():
-			go func() {
-				res := <-done
-				if res.conn != nil {
-					_ = res.conn.Close()
-				}
-			}()
-			return nil, ctx.Err()
-		}
+		return n.dialer(ctx, "tcp", addr)
 	}
-	return net.DialTimeout("tcp", addr, 10*time.Second)
+	return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 }
 
 // New creates a Notifier. Pass nil config to create a no-op notifier.
@@ -195,7 +172,9 @@ func (n *Notifier) sendImplicitTLS(cfg *SMTPConfig, addr string, to []string, ms
 		return fmt.Errorf("smtp tls dial: %w", err)
 	}
 	tlsConn := tls.Client(baseConn, tlsCfg)
-	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = baseConn.Close()
 		return fmt.Errorf("smtp tls handshake: %w", err)
 	}

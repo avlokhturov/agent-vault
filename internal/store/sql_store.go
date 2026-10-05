@@ -1770,11 +1770,22 @@ func (s *SQLStore) UpdateMasterKeyRecord(ctx context.Context, record *MasterKeyR
 // --- Broker Configs ---
 
 func (s *SQLStore) SetBrokerConfig(ctx context.Context, vaultID string, servicesJSON string) (*BrokerConfig, error) {
+	tx, err := s.db.BeginTx(ctx, s.upstreamProxyTxOptions())
+	if err != nil {
+		return nil, fmt.Errorf("setting broker config: beginning transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.lockUpstreamProxyState(ctx, tx); err != nil {
+		return nil, fmt.Errorf("setting broker config: locking proxy state: %w", err)
+	}
+	if err := s.validateUpstreamProxyRefsTx(ctx, tx, servicesJSON); err != nil {
+		return nil, err
+	}
+
 	id := newUUID()
 	now := time.Now().UTC()
 	nowStr := s.dialect.FormatTime(now)
-
-	_, err := s.db.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		s.dialect.Rebind(`INSERT INTO broker_configs (id, vault_id, services_json, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(vault_id) DO UPDATE SET
@@ -1785,7 +1796,9 @@ func (s *SQLStore) SetBrokerConfig(ctx context.Context, vaultID string, services
 	if err != nil {
 		return nil, fmt.Errorf("setting broker config: %w", err)
 	}
-
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("setting broker config: committing: %w", err)
+	}
 	return &BrokerConfig{
 		ID: id, VaultID: vaultID, ServicesJSON: servicesJSON,
 		CreatedAt: now, UpdatedAt: now,
@@ -1999,12 +2012,17 @@ func (s *SQLStore) GetProposalCredentials(ctx context.Context, vaultID string, p
 func (s *SQLStore) ApplyProposal(ctx context.Context, vaultID string, proposalID int, mergedServicesJSON string, credentials map[string]EncryptedCredential, deleteCredentialKeys []string, oauthConfigs []OAuthCredentialConfig) error {
 	nowStr := s.now()
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, s.upstreamProxyTxOptions())
 	if err != nil {
 		return fmt.Errorf("beginning transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-
+	if err := s.lockUpstreamProxyState(ctx, tx); err != nil {
+		return fmt.Errorf("locking upstream proxy state: %w", err)
+	}
+	if err := s.validateUpstreamProxyRefsTx(ctx, tx, mergedServicesJSON); err != nil {
+		return err
+	}
 	// 1. Update broker config with merged services.
 	_, err = tx.ExecContext(ctx,
 		s.dialect.Rebind(`UPDATE broker_configs SET services_json = ?, updated_at = ? WHERE vault_id = ?`),
