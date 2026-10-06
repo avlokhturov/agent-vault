@@ -37,6 +37,15 @@ func proxyRequest(t *testing.T, srv *Server, method, path, token, body string) *
 	return rec
 }
 
+func proxyFixtureJSON(t *testing.T, fields map[string]any) string {
+	t.Helper()
+	body, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("marshal proxy fixture: %v", err)
+	}
+	return string(body)
+}
+
 func decodeProxyView(t *testing.T, rec *httptest.ResponseRecorder) proxyView {
 	t.Helper()
 	var resp struct {
@@ -171,11 +180,19 @@ func TestUpstreamProxyCredentialsAreWriteOnlyAndPatchedIndependently(t *testing.
 	ms, ownerToken := setupMockStoreWithSession(t)
 	srv := newTestServer(withStore(ms))
 
+	// Deterministic per-test fixtures, not credentials for an external service.
+	username := t.Name() + "/username"
+	password := t.Name() + "/password"
+	updatedUsername := username + "/updated"
+	updatedPassword := password + "/updated"
+	ignoredUsername := username + "/ignored"
+	ignoredPassword := password + "/ignored"
+
 	assertWriteOnly := func(rec *httptest.ResponseRecorder) {
 		t.Helper()
 		var body map[string]json.RawMessage
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-			t.Fatalf("decode response: %v (body %s)", err, rec.Body.String())
+			t.Fatalf("decode response: %v", err)
 		}
 		var profile map[string]json.RawMessage
 		if proxy, ok := body["proxy"]; ok {
@@ -189,31 +206,34 @@ func TestUpstreamProxyCredentialsAreWriteOnlyAndPatchedIndependently(t *testing.
 			}
 			for _, item := range list {
 				if _, ok := item["username"]; ok {
-					t.Fatalf("proxy list contains username: %s", rec.Body.String())
+					t.Fatal("proxy list contains username")
 				}
 				if _, ok := item["password"]; ok {
-					t.Fatalf("proxy list contains password: %s", rec.Body.String())
+					t.Fatal("proxy list contains password")
 				}
 			}
 		}
 		for _, key := range []string{"username", "password"} {
 			if _, ok := profile[key]; ok {
-				t.Fatalf("response contains %s: %s", key, rec.Body.String())
+				t.Fatalf("response contains %s", key)
 			}
 		}
 		for _, secret := range []string{
-			"svc-egress", "hunter2", "new-user", "new-pass", "ignored-user", "ignored-pass",
+			username, password, updatedUsername, updatedPassword, ignoredUsername, ignoredPassword,
 			base64.StdEncoding.EncodeToString(ms.upstreamProxies["corp"].UsernameCT),
 			base64.StdEncoding.EncodeToString(ms.upstreamProxies["corp"].PasswordCT),
 		} {
 			if secret != "" && strings.Contains(rec.Body.String(), secret) {
-				t.Fatalf("response leaked secret/ciphertext %q: %s", secret, rec.Body.String())
+				t.Fatal("response leaked credential or ciphertext")
 			}
 		}
 	}
 
 	rec := proxyRequest(t, srv, http.MethodPost, "/v1/admin/upstream-proxies", ownerToken,
-		`{"name":"corp","scheme":"http","host":"proxy.internal:3128","username":"svc-egress","password":"hunter2","on_failure":"fail_closed","is_default":true}`)
+		proxyFixtureJSON(t, map[string]any{
+			"name": "corp", "scheme": "http", "host": "proxy.internal:3128",
+			"username": username, "password": password, "on_failure": "fail_closed", "is_default": true,
+		}))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -233,7 +253,8 @@ func TestUpstreamProxyCredentialsAreWriteOnlyAndPatchedIndependently(t *testing.
 	}
 	assertWriteOnly(rec)
 
-	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"username":"new-user"}`)
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken,
+		proxyFixtureJSON(t, map[string]any{"username": updatedUsername}))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("username update = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -242,11 +263,12 @@ func TestUpstreamProxyCredentialsAreWriteOnlyAndPatchedIndependently(t *testing.
 	if err != nil {
 		t.Fatalf("resolve after username update: %v", err)
 	}
-	if got == nil || got.Username != "new-user" || got.Password != "hunter2" {
-		t.Fatalf("resolved credentials after username update = %#v, want new-user/hunter2", got)
+	if got == nil || got.Username != updatedUsername || got.Password != password {
+		t.Fatal("username-only patch must update username and preserve password")
 	}
 
-	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"password":"new-pass"}`)
+	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken,
+		proxyFixtureJSON(t, map[string]any{"password": updatedPassword}))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("password update = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -255,16 +277,16 @@ func TestUpstreamProxyCredentialsAreWriteOnlyAndPatchedIndependently(t *testing.
 	if err != nil {
 		t.Fatalf("resolve after password update: %v", err)
 	}
-	if got == nil || got.Username != "new-user" || got.Password != "new-pass" {
-		t.Fatalf("resolved credentials after password update = %#v, want new-user/new-pass", got)
+	if got == nil || got.Username != updatedUsername || got.Password != updatedPassword {
+		t.Fatal("password-only patch must update password and preserve username")
 	}
 	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("empty patch = %d: %s", rec.Code, rec.Body.String())
 	}
 	got, err = srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
-	if err != nil || got == nil || got.Username != "new-user" || got.Password != "new-pass" {
-		t.Fatalf("credentials after empty patch = %#v, err %v; want new-user/new-pass", got, err)
+	if err != nil || got == nil || got.Username != updatedUsername || got.Password != updatedPassword {
+		t.Fatalf("empty patch must preserve both credentials: %v", err)
 	}
 
 	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"username":""}`)
@@ -272,8 +294,8 @@ func TestUpstreamProxyCredentialsAreWriteOnlyAndPatchedIndependently(t *testing.
 		t.Fatalf("empty username update = %d: %s", rec.Code, rec.Body.String())
 	}
 	got, err = srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
-	if err != nil || got == nil || got.Username != "" || got.Password != "new-pass" {
-		t.Fatalf("credentials after empty username = %#v, err %v; want empty/new-pass", got, err)
+	if err != nil || got == nil || got.Username != "" || got.Password != updatedPassword {
+		t.Fatalf("clearing username must preserve password: %v", err)
 	}
 	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken, `{"password":""}`)
 	if rec.Code != http.StatusOK {
@@ -281,11 +303,13 @@ func TestUpstreamProxyCredentialsAreWriteOnlyAndPatchedIndependently(t *testing.
 	}
 	got, err = srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
 	if err != nil || got == nil || got.Username != "" || got.Password != "" {
-		t.Fatalf("credentials after empty password = %#v, err %v; want empty/empty", got, err)
+		t.Fatalf("clearing password must leave both credentials empty: %v", err)
 	}
 
 	rec = proxyRequest(t, srv, http.MethodPatch, "/v1/admin/upstream-proxies/corp", ownerToken,
-		`{"username":"ignored-user","password":"ignored-pass","clear_auth":true}`)
+		proxyFixtureJSON(t, map[string]any{
+			"username": ignoredUsername, "password": ignoredPassword, "clear_auth": true,
+		}))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("clear_auth update = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -295,16 +319,21 @@ func TestUpstreamProxyCredentialsAreWriteOnlyAndPatchedIndependently(t *testing.
 		t.Fatalf("resolve after clear_auth: %v", err)
 	}
 	if got == nil || got.Username != "" || got.Password != "" || decodeProxyView(t, rec).HasAuth {
-		t.Fatalf("credentials after clear_auth = %#v, has_auth=%v; want cleared", got, decodeProxyView(t, rec).HasAuth)
+		t.Fatal("clear_auth must clear both credentials and has_auth")
 	}
 }
 
 func TestUpstreamProxyEmptyCredentialPatchClearsRuntimeAuth(t *testing.T) {
 	ms, ownerToken := setupMockStoreWithSession(t)
 	srv := newTestServer(withStore(ms))
+	username := t.Name() + "/username"
+	password := t.Name() + "/password"
 
 	rec := proxyRequest(t, srv, http.MethodPost, "/v1/admin/upstream-proxies", ownerToken,
-		`{"name":"corp","scheme":"http","host":"proxy.internal:3128","username":"svc-egress","password":"hunter2","is_default":true}`)
+		proxyFixtureJSON(t, map[string]any{
+			"name": "corp", "scheme": "http", "host": "proxy.internal:3128",
+			"username": username, "password": password, "is_default": true,
+		}))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -313,14 +342,14 @@ func TestUpstreamProxyEmptyCredentialPatchClearsRuntimeAuth(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("clear username = %d: %s", rec.Code, rec.Body.String())
 	}
-	if strings.Contains(rec.Body.String(), "svc-egress") || strings.Contains(rec.Body.String(), "hunter2") {
-		t.Fatalf("patch response leaked credentials: %s", rec.Body.String())
+	if strings.Contains(rec.Body.String(), username) || strings.Contains(rec.Body.String(), password) {
+		t.Fatal("patch response leaked credentials")
 	}
 	if len(ms.upstreamProxies["corp"].UsernameCT) != 0 || len(ms.upstreamProxies["corp"].PasswordCT) == 0 {
 		t.Fatal("clearing username must remove its ciphertext and preserve password")
 	}
 	runtimeProfile, err := srv.UpstreamProxyResolver().ResolveUpstreamProxy(context.Background(), "", "")
-	if err != nil || runtimeProfile == nil || runtimeProfile.Username != "" || runtimeProfile.Password != "hunter2" {
+	if err != nil || runtimeProfile == nil || runtimeProfile.Username != "" || runtimeProfile.Password != password {
 		t.Fatalf("runtime credentials after clearing username differ from empty/preserved password: %v", err)
 	}
 
@@ -331,8 +360,8 @@ func TestUpstreamProxyEmptyCredentialPatchClearsRuntimeAuth(t *testing.T) {
 	if decodeProxyView(t, rec).HasAuth {
 		t.Fatalf("PATCH has_auth = true after clearing both credentials: %s", rec.Body.String())
 	}
-	if strings.Contains(rec.Body.String(), "svc-egress") || strings.Contains(rec.Body.String(), "hunter2") {
-		t.Fatalf("patch response leaked credentials: %s", rec.Body.String())
+	if strings.Contains(rec.Body.String(), username) || strings.Contains(rec.Body.String(), password) {
+		t.Fatal("patch response leaked credentials")
 	}
 	if len(ms.upstreamProxies["corp"].UsernameCT) != 0 || len(ms.upstreamProxies["corp"].PasswordCT) != 0 {
 		t.Fatal("clearing both credentials must remove both ciphertexts")
@@ -349,8 +378,8 @@ func TestUpstreamProxyEmptyCredentialPatchClearsRuntimeAuth(t *testing.T) {
 	if decodeProxyView(t, rec).HasAuth {
 		t.Fatalf("GET has_auth = true after clearing both credentials: %s", rec.Body.String())
 	}
-	if strings.Contains(rec.Body.String(), "svc-egress") || strings.Contains(rec.Body.String(), "hunter2") {
-		t.Fatalf("GET response leaked credentials: %s", rec.Body.String())
+	if strings.Contains(rec.Body.String(), username) || strings.Contains(rec.Body.String(), password) {
+		t.Fatal("GET response leaked credentials")
 	}
 }
 

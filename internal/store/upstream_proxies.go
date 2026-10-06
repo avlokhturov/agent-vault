@@ -40,6 +40,7 @@ func (s *SQLStore) ListUpstreamProxies(ctx context.Context) ([]UpstreamProxy, er
 }
 
 func (s *SQLStore) GetUpstreamProxyByName(ctx context.Context, name string) (*UpstreamProxy, error) {
+	// #nosec G701 -- upstreamProxyColumns is constant SQL; the profile name is bound.
 	row := s.db.QueryRowContext(ctx,
 		s.dialect.Rebind("SELECT "+upstreamProxyColumns+" FROM upstream_proxies WHERE name = ?"), name)
 	p, err := s.scanUpstreamProxy(row)
@@ -56,6 +57,7 @@ func (s *SQLStore) GetUpstreamProxyByName(ctx context.Context, name string) (*Up
 // sql.ErrNoRows when none is marked default or the marked one is disabled.
 func (s *SQLStore) GetDefaultUpstreamProxy(ctx context.Context) (*UpstreamProxy, error) {
 	query := s.dialect.Rebind("SELECT " + upstreamProxyColumns + " FROM upstream_proxies WHERE is_default = ? AND enabled = ?")
+	// #nosec G701 -- The query uses constant columns and SQL; both flags are bound.
 	row := s.db.QueryRowContext(ctx, query,
 		s.dialect.BoolVal(true), s.dialect.BoolVal(true))
 	p, err := s.scanUpstreamProxy(row)
@@ -90,6 +92,7 @@ func (s *SQLStore) CreateUpstreamProxy(ctx context.Context, p *UpstreamProxy) er
 	}
 
 	if p.IsDefault {
+		// #nosec G701 -- Rebind only rewrites this fixed template's placeholders; flags and timestamp are bound.
 		if _, err := tx.ExecContext(ctx,
 			s.dialect.Rebind("UPDATE upstream_proxies SET is_default = ?, updated_at = ? WHERE is_default = ?"),
 			s.dialect.BoolVal(false), now, s.dialect.BoolVal(true)); err != nil {
@@ -98,6 +101,7 @@ func (s *SQLStore) CreateUpstreamProxy(ctx context.Context, p *UpstreamProxy) er
 	}
 	// The transaction-wide reservation serializes default changes.
 
+	// #nosec G701 -- Rebind only rewrites this fixed template's placeholders; every profile field is bound.
 	if _, err := tx.ExecContext(ctx, s.dialect.Rebind(`INSERT INTO upstream_proxies (
 		id, name, scheme, host, username_ct, username_nonce, password_ct, password_nonce,
 		no_proxy, proxy_ca_pem, on_failure, is_default, enabled, created_at, updated_at
@@ -169,6 +173,7 @@ func (s *SQLStore) UpdateUpstreamProxy(ctx context.Context, params UpdateUpstrea
 	}
 	if params.IsDefault != nil {
 		if *params.IsDefault {
+			// #nosec G701 -- Rebind only rewrites this fixed template's placeholders; flags and timestamp are bound.
 			if _, err := tx.ExecContext(ctx,
 				s.dialect.Rebind("UPDATE upstream_proxies SET is_default = ?, updated_at = ? WHERE is_default = ?"),
 				s.dialect.BoolVal(false), s.now(), s.dialect.BoolVal(true)); err != nil {
@@ -186,6 +191,7 @@ func (s *SQLStore) UpdateUpstreamProxy(ctx context.Context, params UpdateUpstrea
 	args = append(args, s.now())
 	args = append(args, params.Name)
 
+	// #nosec G701 -- SET columns come only from literal add calls above; all values and the name are bound.
 	if _, err := tx.ExecContext(ctx,
 		s.dialect.Rebind("UPDATE upstream_proxies SET "+strings.Join(setClauses, ", ")+" WHERE name = ?"),
 		args...); err != nil {
@@ -218,6 +224,7 @@ func (s *SQLStore) DeleteUpstreamProxy(ctx context.Context, name string) error {
 	if len(refs) != 0 {
 		return &UpstreamProxyReferencedError{Name: name, References: refs}
 	}
+	// #nosec G701 -- Rebind only rewrites this fixed template's placeholders; the profile name is bound.
 	res, err := tx.ExecContext(ctx,
 		s.dialect.Rebind("DELETE FROM upstream_proxies WHERE name = ?"), name)
 	if err != nil {
@@ -313,6 +320,7 @@ func (s *SQLStore) validateUpstreamProxyRefsTx(ctx context.Context, tx *sql.Tx, 
 		}
 		seen[name] = struct{}{}
 		var exists int
+		// #nosec G701 -- Rebind only rewrites this fixed template's placeholders; the decoded profile name is bound.
 		err := tx.QueryRowContext(ctx, s.dialect.Rebind("SELECT 1 FROM upstream_proxies WHERE name = ?"), name).Scan(&exists)
 		if errors.Is(err, sql.ErrNoRows) {
 			return &UnknownUpstreamProxyError{Name: name}
@@ -341,6 +349,7 @@ func (s *SQLStore) lockUpstreamProxyState(ctx context.Context, tx *sql.Tx) error
 }
 
 func (s *SQLStore) getUpstreamProxyTx(ctx context.Context, tx *sql.Tx, name string) (*UpstreamProxy, error) {
+	// #nosec G701 -- upstreamProxyColumns is constant SQL; the profile name is bound.
 	row := tx.QueryRowContext(ctx,
 		s.dialect.Rebind("SELECT "+upstreamProxyColumns+" FROM upstream_proxies WHERE name = ?"), name)
 	p, err := s.scanUpstreamProxy(row)

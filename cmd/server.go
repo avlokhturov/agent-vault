@@ -284,6 +284,7 @@ func attachLogSink(srv *server.Server, db store.Store, logger *slog.Logger) func
 	sink := requestlog.NewBatchSink(db, logger, requestlog.BatchSinkConfig{})
 	srv.AttachLogSink(sink)
 
+	// #nosec G118 -- Cancellation ownership is returned to the caller; the shutdown closure below calls cancelRetention.
 	retentionCtx, cancelRetention := context.WithCancel(context.Background())
 	go requestlog.RunRetention(retentionCtx, db, logger)
 
