@@ -336,23 +336,51 @@ func (p *Proxy) forwardRequest(
 		return
 	}
 
+	logFailure := func(stage string, err error) {
+		// Client-style errors can include a complete URL with substituted
+		// credentials. Log the transport cause, never that URL.
+		for {
+			var urlErr *url.Error
+			if !errors.As(err, &urlErr) {
+				break
+			}
+			err = urlErr.Err
+		}
+		attrs := make([]slog.Attr, 0, 11)
+		attrs = append(attrs,
+			slog.String("vault_id", scope.VaultID),
+			slog.String("vault_name", scope.VaultName),
+			slog.String("target_host", target),
+			slog.String("method", r.Method),
+			slog.String("service", event.MatchedService),
+			slog.String("stage", stage),
+			slog.String("error", err.Error()),
+		)
+		if route.profile == nil {
+			attrs = append(attrs, slog.String("route", "direct"))
+		} else {
+			attrs = append(attrs,
+				slog.String("route", "upstream_proxy"),
+				slog.String("profile", route.profile.Name),
+				slog.String("proxy_scheme", route.profile.Scheme),
+				slog.String("proxy_host", route.profile.Host),
+			)
+		}
+		p.logger.LogAttrs(r.Context(), slog.LevelWarn, "upstream request failed", attrs...)
+	}
+
 	if wsUpgrade {
 		wsSubs := filterWebSocketSubs(inject.Substitutions)
 		if len(wsSubs) > 0 {
 			outReq.Header.Del("Sec-Websocket-Extensions")
 		}
-		p.forwardWebSocket(w, r, outReq, wsSubs, emit, route)
+		p.forwardWebSocket(w, r, outReq, wsSubs, emit, route, logFailure)
 		return
 	}
 
 	resp, err := p.roundTrip(outReq, route, target)
 	if err != nil {
-		p.logger.Debug("upstream request failed",
-			slog.String("vault_id", scope.VaultID),
-			slog.String("vault_name", scope.VaultName),
-			slog.String("target_host", target),
-			slog.String("error", err.Error()),
-		)
+		logFailure("round_trip", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		emit(http.StatusBadGateway, "upstream_error")
 		return
