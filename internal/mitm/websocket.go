@@ -59,9 +59,11 @@ func (p *Proxy) forwardWebSocket(
 	wsSubs []brokercore.ResolvedSubstitution,
 	emit func(status int, errCode string),
 	route upstreamRoute,
+	logFailure func(stage string, err error),
 ) {
 	upstreamConn, upstreamReader, resp, err := p.dialWebSocketUpstream(r.Context(), outReq, route)
 	if err != nil {
+		logFailure("websocket_handshake", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		emit(http.StatusBadGateway, "upstream_error")
 		return
