@@ -55,8 +55,8 @@ func (s *SQLStore) GetUpstreamProxyByName(ctx context.Context, name string) (*Up
 // GetDefaultUpstreamProxy returns the instance-level fallback profile, or
 // sql.ErrNoRows when none is marked default or the marked one is disabled.
 func (s *SQLStore) GetDefaultUpstreamProxy(ctx context.Context) (*UpstreamProxy, error) {
-	row := s.db.QueryRowContext(ctx,
-		"SELECT "+upstreamProxyColumns+" FROM upstream_proxies WHERE is_default = ? AND enabled = ?",
+	query := s.dialect.Rebind("SELECT " + upstreamProxyColumns + " FROM upstream_proxies WHERE is_default = ? AND enabled = ?")
+	row := s.db.QueryRowContext(ctx, query,
 		s.dialect.BoolVal(true), s.dialect.BoolVal(true))
 	p, err := s.scanUpstreamProxy(row)
 	if err != nil {

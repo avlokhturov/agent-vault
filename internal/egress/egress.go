@@ -592,7 +592,7 @@ func (r *Registry) wrapTargetPolicy(p *brokercore.UpstreamProxy, dialer proxy.Co
 				ips, lookupErr := net.DefaultResolver.LookupIPAddr(dialCtx, host)
 				if lookupErr != nil {
 					var dnsErr *net.DNSError
-					if !(errors.As(lookupErr, &dnsErr) && dnsErr.IsNotFound && ctx.Err() == nil) {
+					if !errors.As(lookupErr, &dnsErr) || !dnsErr.IsNotFound || ctx.Err() != nil {
 						return nil, lookupErr
 					}
 				} else if len(ips) == 0 {

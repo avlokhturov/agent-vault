@@ -371,7 +371,11 @@ func TestControlPlaneResolverErrorDoesNotReachTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := srv.ControlPlaneRoundTripper(nil).RoundTrip(req); err == nil {
+	resp, err := srv.ControlPlaneRoundTripper(nil).RoundTrip(req)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	if err == nil {
 		t.Fatal("resolver failure must fail closed")
 	}
 	if hits != 0 {

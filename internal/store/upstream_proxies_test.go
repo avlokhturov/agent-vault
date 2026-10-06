@@ -414,6 +414,14 @@ func assertConcurrentProxyInvariants(t *testing.T, first, second *SQLStore) {
 		t.Fatalf("concurrent promotions left %d defaults, want exactly one", defaults)
 	}
 
+	defaultProxy, err := first.GetDefaultUpstreamProxy(ctx)
+	if err != nil {
+		t.Fatalf("resolving the default after concurrent promotion: %v", err)
+	}
+	if defaultProxy == nil || (defaultProxy.Name != "promote-a" && defaultProxy.Name != "promote-b") {
+		t.Fatalf("default profile = %+v, want one of the promoted profiles", defaultProxy)
+	}
+
 	if err := first.CreateUpstreamProxy(ctx, &UpstreamProxy{Name: "race-reference", Scheme: "http", Host: "proxy:3128", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}

@@ -30,7 +30,7 @@ func (b *failureLogBuffer) Write(p []byte) (int, error) {
 func (b *failureLogBuffer) snapshot() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.Buffer.String()
+	return b.String()
 }
 
 func TestMITMUpstreamFailureLoggedAtInfoWithoutSecrets(t *testing.T) {

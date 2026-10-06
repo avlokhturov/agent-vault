@@ -46,7 +46,7 @@ The default also routes requests to the Infisical API from the first machine-ide
 | `is_default` | Off by default when created in the UI. When enabled, applies to services opted in with `use_upstream_proxy: true`, older services without an explicit choice, unmatched brokered requests, and the broker's own outbound calls. Setting it clears the previous default — there is at most one. |
 | `enabled` | When false, the profile is skipped and its traffic falls back to the default (or dials directly). |
 
-The database enforces at most one default. If an existing database already has multiple defaults, the invariant migration stops without selecting a route for the operator; resolve the duplicates before upgrading.
+Default-profile selection and service-reference checks have the same semantics on SQLite and PostgreSQL. The database enforces at most one default. If an existing database already has multiple defaults, the invariant migration stops without selecting a route for the operator; resolve the duplicates before upgrading.
 
 ### Schemes
 

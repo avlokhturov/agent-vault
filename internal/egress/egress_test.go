@@ -753,7 +753,10 @@ func TestRoundTripWithFallbackReplaysOnlyBoundedKnownBodies(t *testing.T) {
 				}
 				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
 			})
-			_, err = RoundTripWithFallback(req, profile, via, direct, nil)
+			resp, err := RoundTripWithFallback(req, profile, via, direct, nil)
+			if resp != nil {
+				defer resp.Body.Close()
+			}
 			if tc.wantReplay && err != nil {
 				t.Fatalf("RoundTripWithFallback: %v", err)
 			}
@@ -833,7 +836,11 @@ func TestRoundTripWithFallbackRejectsUnreadableOrMismatchedBodyBeforeNetwork(t *
 				networkCalls++
 				return nil, nil
 			})
-			if _, err := RoundTripWithFallback(req, profile, rt, rt, nil); err == nil {
+			resp, err := RoundTripWithFallback(req, profile, rt, rt, nil)
+			if resp != nil {
+				defer resp.Body.Close()
+			}
+			if err == nil {
 				t.Fatal("invalid body must fail before network")
 			}
 			if networkCalls != 0 {
@@ -862,7 +869,11 @@ func TestRoundTripWithFallbackStopsWhenGetBodyFails(t *testing.T) {
 		directCalls++
 		return nil, nil
 	})
-	if _, err := RoundTripWithFallback(req, profile, via, direct, nil); err == nil {
+	resp, err := RoundTripWithFallback(req, profile, via, direct, nil)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	if err == nil {
 		t.Fatal("GetBody error must terminate fallback")
 	}
 	if directCalls != 0 {

@@ -77,14 +77,15 @@ func applyServiceEgressChoices(incoming, existing []broker.Service, fields []ser
 		svc := &incoming[i]
 		previousIndex, exists := byName[svc.Name]
 		if svc.UpstreamProxy == "" && !svc.UseUpstreamProxy && !svc.BypassUpstreamProxy {
-			if len(fields[i].UpstreamProxy) != 0 || len(fields[i].UseUpstreamProxy) != 0 || len(fields[i].BypassUpstreamProxy) != 0 {
+			switch {
+			case len(fields[i].UpstreamProxy) != 0 || len(fields[i].UseUpstreamProxy) != 0 || len(fields[i].BypassUpstreamProxy) != 0:
 				svc.BypassUpstreamProxy = true
-			} else if exists {
+			case exists:
 				previous := existing[previousIndex]
 				svc.UpstreamProxy = previous.UpstreamProxy
 				svc.UseUpstreamProxy = previous.UseUpstreamProxy
 				svc.BypassUpstreamProxy = previous.BypassUpstreamProxy
-			} else {
+			default:
 				svc.BypassUpstreamProxy = true
 			}
 		}
@@ -469,7 +470,7 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 	// The store serializes statements but not the load → validate → save
 	// sequence; without this lock concurrent upserts can both pass the
 	// duplicate-name check against the same pre-state.
-	unlock, err := s.lockVaultServices(ctx, ns.ID)
+	unlock, err := s.lockVault(ctx, ns.ID)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "lock failed")
 		return
@@ -555,7 +556,7 @@ func (s *Server) handleServiceRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	unlock, err := s.lockVaultServices(ctx, ns.ID)
+	unlock, err := s.lockVault(ctx, ns.ID)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "lock failed")
 		return
@@ -646,7 +647,7 @@ func (s *Server) handleServicePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	unlock, err := s.lockVaultServices(ctx, ns.ID)
+	unlock, err := s.lockVault(ctx, ns.ID)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "lock failed")
 		return
@@ -752,7 +753,7 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	unlock, err := s.lockVaultServices(ctx, ns.ID)
+	unlock, err := s.lockVault(ctx, ns.ID)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "lock failed")
 		return
@@ -803,7 +804,7 @@ func (s *Server) handleServicesClear(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	unlock, err := s.lockVaultServices(ctx, ns.ID)
+	unlock, err := s.lockVault(ctx, ns.ID)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "lock failed")
 		return
@@ -821,22 +822,4 @@ func (s *Server) handleServicesClear(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleServiceCatalog(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{"services": catalog.GetAll()})
-}
-
-// SetSkills sets the embedded skill content.
-func (s *Server) SetSkills(cli string) {
-	s.skillCLI = []byte(cli)
-}
-
-func (s *Server) handleSkillCLI(w http.ResponseWriter, r *http.Request) {
-	s.serveSkill(w, r, s.skillCLI)
-}
-
-func (s *Server) serveSkill(w http.ResponseWriter, r *http.Request, content []byte) {
-	if len(content) == 0 {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
-	_, _ = w.Write(content)
 }
